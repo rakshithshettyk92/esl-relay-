@@ -41,38 +41,36 @@ function validateAuth(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /webhook  — receives ESL button events from AIMS and pushes to phones
-//
-// AIMS payload will vary by system. We try common field names and fall back
-// to the full body as a JSON string so nothing is lost.
+// Shared handler — processes AIMS payload and sends FCM push
+// Mounted on both POST / and POST /webhook so it works regardless of
+// how the URL is configured in AIMS.
 // ---------------------------------------------------------------------------
-app.post('/webhook', validateAuth, async (req, res) => {
+async function handleWebhook(req, res) {
   try {
     const body = req.body ?? {};
     console.log('Webhook received:', JSON.stringify(body));
 
-    // Extract human-readable info from whatever AIMS sends
-    const label    = body.label    || body.buttonLabel || body.button_label || '';
-    const location = body.location || body.shelf       || body.zone         || body.aisle || '';
-    const message  = body.message  || body.description || '';
+    // AIMS ESL payload fields
+    const button     = body.button     || '';                          // e.g. "ALARM"
+    const labelCode  = body.labelCode  || '';                          // e.g. "0F23D1AD669C"
+    const articleIds = Array.isArray(body.articleIds)
+      ? body.articleIds.join(', ')
+      : (body.articleIds || '');                                       // e.g. "NP_KASHI"
 
-    const alertMessage =
-      [label, location].filter(Boolean).join(' — ') ||
-      message ||
-      'Employee call — button pressed';
+    // Build a clear, readable alert message
+    const parts = [button, articleIds, labelCode ? `[${labelCode}]` : ''];
+    const alertMessage = parts.filter(Boolean).join(' — ') || 'Employee call — button pressed';
 
-    // Send push notification to ALL phones subscribed to the "employee-calls" topic.
-    // No device tokens to manage — phones subscribe when the app first opens.
     const fcmMessage = {
       topic: process.env.FCM_TOPIC || 'employee-calls',
       data: {
         title:   'Employee Call',
         message: alertMessage,
-        payload: JSON.stringify(body),  // raw payload forwarded to the app
+        payload: JSON.stringify(body),
       },
       android: {
         priority: 'high',
-        ttl: 60000, // 60 seconds — drop if phone doesn't receive within 1 min
+        ttl: 60000,
       },
     };
 
@@ -84,7 +82,11 @@ app.post('/webhook', validateAuth, async (req, res) => {
     console.error('Error processing webhook:', err);
     res.status(500).json({ error: err.message });
   }
-});
+}
+
+// Accept on both root and /webhook path
+app.post('/',        validateAuth, handleWebhook);
+app.post('/webhook', validateAuth, handleWebhook);
 
 // ---------------------------------------------------------------------------
 // GET /health — AIMS / Railway health checks hit this
