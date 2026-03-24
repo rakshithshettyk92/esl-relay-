@@ -31,6 +31,11 @@ let tokenCache = {
   expiresAt:    null,
 };
 
+// Tracks which labelCodes have already been acknowledged and by whom.
+// Entries expire after ACKNOWLEDGE_TTL_MS so the label can be called again later.
+const ACKNOWLEDGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const acknowledgements = new Map(); // labelCode → { timestamp, by }
+
 // ===========================================================================
 // ESL Auth — Token Management
 // ===========================================================================
@@ -289,7 +294,31 @@ app.post('/esl/acknowledge', validateAuth, async (req, res) => {
   if (!companyCode || !labelCode) {
     return res.status(400).json({ error: 'companyCode and labelCode are required' });
   }
+
+  // Check if already acknowledged within the TTL window
+  const existing = acknowledgements.get(labelCode);
+  if (existing && (Date.now() - existing.timestamp) < ACKNOWLEDGE_TTL_MS) {
+    console.log(`ESL: ${labelCode} already acknowledged — ignoring duplicate`);
+    return res.status(409).json({
+      status: 'already_acknowledged',
+      message: 'Already acknowledged by another device',
+    });
+  }
+
+  // Mark as acknowledged
+  acknowledgements.set(labelCode, { timestamp: Date.now() });
   console.log(`ESL: Acknowledge from app — ${companyCode} / ${labelCode}`);
+
+  // Push a cancel message to dismiss the popup on all other devices
+  getMessaging().send({
+    topic: process.env.FCM_TOPIC || 'employee-calls',
+    data: {
+      type:      'cancel',
+      labelCode,
+    },
+    android: { priority: 'high', ttl: 30000 },
+  }).catch(err => console.error('FCM cancel send failed:', err.message));
+
   res.json({ status: 'ok' });
   triggerEslActions(companyCode, labelCode); // runs in background
 });
