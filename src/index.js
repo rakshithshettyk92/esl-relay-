@@ -262,23 +262,18 @@ async function handleWebhook(req, res) {
     const fcmResult = await getMessaging().send({
       topic: process.env.FCM_TOPIC || 'employee-calls',
       data: {
-        title:   'Employee Call',
-        message: alertMessage,
-        payload: JSON.stringify(body),
+        title:       'Employee Call',
+        message:     alertMessage,
+        companyCode,           // passed back to app so it can call /esl/acknowledge
+        labelCode,
+        payload:     JSON.stringify(body),
       },
       android: { priority: 'high', ttl: 60000 },
     });
     console.log('FCM sent:', fcmResult);
 
-    // Respond to AIMS immediately
+    // Respond immediately — ESL actions only fire when user taps "On My Way" in the app
     res.status(200).json({ status: 'ok', messageId: fcmResult });
-
-    // ESL actions in background
-    if (companyCode && labelCode) {
-      triggerEslActions(companyCode, labelCode);
-    } else {
-      console.warn('ESL: Missing companyCode or labelCode — skipping label actions');
-    }
   } catch (err) {
     console.error('Webhook error:', err);
     if (!res.headersSent) res.status(500).json({ error: err.message });
@@ -287,6 +282,17 @@ async function handleWebhook(req, res) {
 
 app.post('/',        validateAuth, handleWebhook);
 app.post('/webhook', validateAuth, handleWebhook);
+
+// "On My Way" — triggered by the mobile app when user acknowledges the call
+app.post('/esl/acknowledge', validateAuth, async (req, res) => {
+  const { companyCode, labelCode } = req.body ?? {};
+  if (!companyCode || !labelCode) {
+    return res.status(400).json({ error: 'companyCode and labelCode are required' });
+  }
+  console.log(`ESL: Acknowledge from app — ${companyCode} / ${labelCode}`);
+  res.json({ status: 'ok' });
+  triggerEslActions(companyCode, labelCode); // runs in background
+});
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'running', timestamp: new Date().toISOString() });
