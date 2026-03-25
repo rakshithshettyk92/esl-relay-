@@ -264,6 +264,9 @@ async function handleWebhook(req, res) {
     const aisle        = articleIds || labelCode;
     const alertMessage = aisle ? `Customer help needed in ${aisle}` : 'Customer help needed';
 
+    // New button press — clear any stale acknowledgement so it can be acknowledged fresh
+    if (labelCode) acknowledgements.delete(labelCode);
+
     const fcmResult = await getMessaging().send({
       topic: process.env.FCM_TOPIC || 'employee-calls',
       data: {
