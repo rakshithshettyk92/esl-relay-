@@ -33,7 +33,7 @@ let tokenCache = {
 
 // Tracks which labelCodes have already been acknowledged and by whom.
 // Entries expire after ACKNOWLEDGE_TTL_MS so the label can be called again later.
-const ACKNOWLEDGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const ACKNOWLEDGE_TTL_MS = 1 * 60 * 1000; // 1 minute (testing)
 const acknowledgements = new Map(); // labelCode → { timestamp, by }
 
 // ===========================================================================
