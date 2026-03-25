@@ -261,8 +261,8 @@ async function handleWebhook(req, res) {
       ? eventInfo.articleIds.join(', ')
       : (eventInfo.articleIds ?? '');
 
-    const parts        = [button, articleIds, labelCode ? `[${labelCode}]` : ''];
-    const alertMessage = parts.filter(Boolean).join(' — ') || 'Employee call — button pressed';
+    const aisle        = articleIds || labelCode;
+    const alertMessage = aisle ? `Customer help needed in ${aisle}` : 'Customer help needed';
 
     const fcmResult = await getMessaging().send({
       topic: process.env.FCM_TOPIC || 'employee-calls',
