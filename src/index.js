@@ -90,7 +90,45 @@ function saveMappings() {
   }
 }
 
+// ===========================================================================
+// Call log — append-only JSONL of every accepted call + its status updates.
+// Powers /admin/analytics. Survives restarts only when a Railway Volume is
+// mounted at /app/data; otherwise the file resets on each redeploy.
+// ===========================================================================
 
+const CALL_LOG_FILE = path.join(__dirname, '..', 'data', 'call-log.jsonl');
+// Drop events older than this on read so the file doesn't grow without bound.
+// 30d is the longest range the analytics UI exposes; keep a buffer.
+const CALL_LOG_RETENTION_MS = 45 * 24 * 60 * 60 * 1000;
+
+function appendCallEvent(event) {
+  try {
+    fs.mkdirSync(path.dirname(CALL_LOG_FILE), { recursive: true });
+    fs.appendFileSync(CALL_LOG_FILE, JSON.stringify(event) + '\n');
+  } catch (err) {
+    console.error('CallLog: append failed:', err.message);
+  }
+}
+
+function readCallEvents(sinceTs = 0) {
+  try {
+    if (!fs.existsSync(CALL_LOG_FILE)) return [];
+    const raw = fs.readFileSync(CALL_LOG_FILE, 'utf8');
+    const cutoff = Math.max(sinceTs, Date.now() - CALL_LOG_RETENTION_MS);
+    const out = [];
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      try {
+        const e = JSON.parse(line);
+        if (typeof e.ts === 'number' && e.ts >= cutoff) out.push(e);
+      } catch (_) { /* skip malformed */ }
+    }
+    return out;
+  } catch (err) {
+    console.error('CallLog: read failed:', err.message);
+    return [];
+  }
+}
 
 // ===========================================================================
 // ESL Auth — Token Management
@@ -432,6 +470,17 @@ async function handleWebhook(req, res) {
     });
     console.log(`FCM sent (topic=${topic}):`, fcmResult);
 
+    appendCallEvent({
+      type:         'delivered',
+      ts:           Date.now(),
+      company:      companyCode,
+      store:        storeCode,
+      labelCode,
+      articleId,
+      articleName:  name,
+      aisle:        aisle || null,
+    });
+
     // Respond immediately — ESL actions only fire when user taps "On My Way" in the app
     res.status(200).json({ status: 'ok', messageId: fcmResult });
   } catch (err) {
@@ -464,6 +513,14 @@ app.post('/esl/acknowledge', validateAuth, async (req, res) => {
   acknowledgements.set(labelCode, { timestamp: Date.now() });
   console.log(`ESL: Acknowledge from app — ${companyCode} / ${storeCode} / ${labelCode}`);
 
+  appendCallEvent({
+    type:      'acknowledged',
+    ts:        Date.now(),
+    company:   companyCode,
+    store:     storeCode,
+    labelCode,
+  });
+
   // Push a cancel message to dismiss the popup on all other devices in this store
   const topic = fcmSafeTopic(['employee-calls', companyCode, storeCode]);
   getMessaging().send({
@@ -482,6 +539,27 @@ app.post('/esl/acknowledge', validateAuth, async (req, res) => {
   const rawDelay = Number(mapping.revertDelaySeconds) || 60;
   const delaySec = Math.max(5, Math.min(600, rawDelay));
   triggerEslActions(companyCode, labelCode, delaySec * 1000); // runs in background
+});
+
+// Reports a terminal status for an alert that the relay never observed —
+// missed (timed out on the device) or dismissed (manually closed). Fire-and-
+// forget from the app; failures are logged but never block the user.
+app.post('/esl/status', validateAuth, (req, res) => {
+  const { companyCode, storeCode, labelCode, status } = req.body ?? {};
+  const allowed = new Set(['missed', 'dismissed']);
+  if (!companyCode || !storeCode || !labelCode || !allowed.has(status)) {
+    return res.status(400).json({
+      error: 'companyCode, storeCode, labelCode and status (missed|dismissed) are required',
+    });
+  }
+  appendCallEvent({
+    type:      status,           // 'missed' or 'dismissed'
+    ts:        Date.now(),
+    company:   companyCode,
+    store:     storeCode,
+    labelCode,
+  });
+  res.json({ status: 'ok' });
 });
 
 // ===========================================================================
@@ -564,6 +642,114 @@ app.post('/admin/field-mapping', validateAuth, (req, res) => {
   console.log(`Admin: saved mapping for ${company}/${store}`);
   res.json({ status: 'ok', mapping: clean });
 });
+
+// Aggregates the per-store call log into the shape the Android Analytics
+// screen renders. Status updates are matched back to the most recent prior
+// delivered event for the same (company, store, labelCode) — that's how a
+// "missed"/"acknowledged" event picks up the article name + aisle.
+app.get('/admin/analytics', validateAuth, (req, res) => {
+  const company = (req.query.company ?? '').toString().trim();
+  const store   = (req.query.store   ?? '').toString().trim();
+  const range   = (req.query.range   ?? '7d').toString();
+  if (!company || !store) {
+    return res.status(400).json({ error: 'company and store are required' });
+  }
+
+  const sinceTs = rangeStartMs(range);
+  const events = readCallEvents(sinceTs).filter(
+    e => e.company === company && e.store === store
+  );
+
+  // Walk events in order to stitch status updates back onto their delivered call.
+  events.sort((a, b) => a.ts - b.ts);
+  const calls = [];                          // each: {deliveredAt, articleName, aisle, status, ackedAt}
+  const open  = new Map();                   // labelCode -> index in calls (latest open call)
+
+  for (const e of events) {
+    if (e.type === 'delivered') {
+      const call = {
+        deliveredAt: e.ts,
+        labelCode:   e.labelCode,
+        articleId:   e.articleId,
+        articleName: e.articleName || e.articleId || e.labelCode,
+        aisle:       e.aisle || null,
+        status:      'delivered',
+        ackedAt:     null,
+      };
+      calls.push(call);
+      open.set(e.labelCode, calls.length - 1);
+    } else {
+      const idx = open.get(e.labelCode);
+      if (idx === undefined) continue;  // status update with no prior delivered — ignore
+      const call = calls[idx];
+      call.status = e.type;             // 'acknowledged' | 'missed' | 'dismissed'
+      if (e.type === 'acknowledged') call.ackedAt = e.ts;
+      open.delete(e.labelCode);         // closed
+    }
+  }
+
+  // Totals
+  const totals = { delivered: 0, acknowledged: 0, missed: 0, dismissed: 0 };
+  for (const c of calls) {
+    totals.delivered += 1;
+    if (c.status !== 'delivered') totals[c.status] = (totals[c.status] || 0) + 1;
+  }
+
+  // Response time stats over acknowledged calls
+  const responseMs = calls
+    .filter(c => c.status === 'acknowledged' && c.ackedAt)
+    .map(c => c.ackedAt - c.deliveredAt)
+    .sort((a, b) => a - b);
+  const avgMs = responseMs.length
+    ? Math.round(responseMs.reduce((a, b) => a + b, 0) / responseMs.length)
+    : 0;
+  const p50Ms = responseMs.length ? responseMs[Math.floor(responseMs.length * 0.50)] : 0;
+  const p95Ms = responseMs.length ? responseMs[Math.floor(responseMs.length * 0.95)] : 0;
+
+  res.json({
+    company,
+    store,
+    range,
+    sinceTs,
+    totals,
+    responseMs:  { avg: avgMs, p50: p50Ms, p95: p95Ms, samples: responseMs.length },
+    topAisles:   topByKey(calls, c => c.aisle, 10),
+    topArticles: topByKey(calls, c => c.articleName, 10),
+    perHour:     perHour(calls),
+  });
+});
+
+function rangeStartMs(range) {
+  const now = Date.now();
+  if (range === 'today') {
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  if (range === '30d') return now - 30 * 24 * 60 * 60 * 1000;
+  return now - 7 * 24 * 60 * 60 * 1000;  // default: 7d
+}
+
+function topByKey(calls, keyFn, limit) {
+  const counts = new Map();
+  for (const c of calls) {
+    const k = keyFn(c);
+    if (!k) continue;
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([key, count]) => ({ key, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+}
+
+function perHour(calls) {
+  const buckets = new Array(24).fill(0);
+  for (const c of calls) {
+    const h = new Date(c.deliveredAt).getHours();
+    buckets[h] += 1;
+  }
+  return buckets;
+}
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'running', timestamp: new Date().toISOString() });
