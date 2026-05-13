@@ -48,11 +48,12 @@ const acknowledgements = new Map(); // labelCode → { timestamp, by }
 const MAPPINGS_FILE = path.join(__dirname, '..', 'data', 'field-mappings.json');
 
 const DEFAULT_MAPPING = {
-  articleIdField:   'ARTICLE_ID',
-  articleNameField: 'ITEM_NAME',
-  helpEnabledField: 'ASSOCIATE_HELP_ENABLED',
-  helpEnabledValue: 'Y',
-  aisleField:       null,
+  articleIdField:     'ARTICLE_ID',
+  articleNameField:   'ITEM_NAME',
+  helpEnabledField:   'ASSOCIATE_HELP_ENABLED',
+  helpEnabledValue:   'Y',
+  aisleField:         null,
+  revertDelaySeconds: 60,
 };
 
 const fieldMappings = new Map(); // "company:store" → mapping
@@ -267,13 +268,14 @@ function fcmSafeTopic(parts) {
   return parts.map(p => String(p).replace(/[^A-Za-z0-9_~.%-]/g, '_')).join('-');
 }
 
-async function triggerEslActions(companyCode, labelCode) {
+async function triggerEslActions(companyCode, labelCode, revertDelayMs = 60_000) {
   try {
     await flipPage(companyCode, labelCode, 2);
     await blinkLed(companyCode, labelCode);
 
-    console.log(`ESL: Waiting 60s before reverting ${labelCode}...`);
-    await new Promise(resolve => setTimeout(resolve, 60_000));
+    const secs = Math.round(revertDelayMs / 1000);
+    console.log(`ESL: Waiting ${secs}s before reverting ${labelCode}...`);
+    await new Promise(resolve => setTimeout(resolve, revertDelayMs));
 
     await flipPage(companyCode, labelCode, 1);
     console.log(`ESL: All actions done for ${labelCode}`);
@@ -472,7 +474,12 @@ app.post('/esl/acknowledge', validateAuth, async (req, res) => {
   }).catch(err => console.error('FCM cancel send failed:', err.message));
 
   res.json({ status: 'ok' });
-  triggerEslActions(companyCode, labelCode); // runs in background
+  // Pull the per-store revert delay so the page stays flipped long enough
+  // for the responding staffer to spot it on the shelf. Clamped 5s–600s.
+  const mapping  = getFieldMapping(companyCode, storeCode);
+  const rawDelay = Number(mapping.revertDelaySeconds) || 60;
+  const delaySec = Math.max(5, Math.min(600, rawDelay));
+  triggerEslActions(companyCode, labelCode, delaySec * 1000); // runs in background
 });
 
 // ===========================================================================
@@ -541,12 +548,14 @@ app.post('/admin/field-mapping', validateAuth, (req, res) => {
       return res.status(400).json({ error: `mapping.${field} is required` });
     }
   }
+  const rawDelay = Number(mapping.revertDelaySeconds);
   const clean = {
-    articleIdField:   mapping.articleIdField.trim(),
-    articleNameField: mapping.articleNameField.trim(),
-    helpEnabledField: mapping.helpEnabledField.trim(),
-    helpEnabledValue: mapping.helpEnabledValue.trim(),
-    aisleField:       (mapping.aisleField || '').toString().trim() || null,
+    articleIdField:     mapping.articleIdField.trim(),
+    articleNameField:   mapping.articleNameField.trim(),
+    helpEnabledField:   mapping.helpEnabledField.trim(),
+    helpEnabledValue:   mapping.helpEnabledValue.trim(),
+    aisleField:         (mapping.aisleField || '').toString().trim() || null,
+    revertDelaySeconds: Math.max(5, Math.min(600, Number.isFinite(rawDelay) ? rawDelay : 60)),
   };
   fieldMappings.set(mappingKey(company, store), clean);
   saveMappings();
