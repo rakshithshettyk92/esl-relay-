@@ -409,7 +409,9 @@ async function handleWebhook(req, res) {
     const aisle = mapping.aisleField
       ? (article[mapping.aisleField] ?? '').toString().trim()
       : '';
-    const alertMessage = aisle ? `Help needed for ${name} - ${aisle}` : `Help needed for ${name}`;
+    const alertMessage = aisle
+      ? `Help needed for ${name} - AISLE ${aisle}`
+      : `Help needed for ${name}`;
 
     // New button press — clear any stale acknowledgement so it can be acknowledged fresh
     if (labelCode) acknowledgements.delete(labelCode);
