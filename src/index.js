@@ -382,34 +382,34 @@ async function handleWebhook(req, res) {
     const mapping = getFieldMapping(companyCode, storeCode);
     const article = await fetchArticle(companyCode, storeCode, articleId, mapping);
 
+    // Article must be reachable — we cannot confirm help-enabled without it,
+    // and the rule is "no alert unless explicitly enabled".
+    if (!article) {
+      console.warn(`Webhook: ${articleId} article not available, skipping (cannot verify help-enabled)`);
+      return res.status(200).json({ status: 'skipped', reason: 'article_unavailable' });
+    }
+
     // Filter 1: image-push articles are display labels, never customer calls.
-    if (article && (article.IMAGE_URL ?? '').toString().trim() !== '') {
+    if ((article.IMAGE_URL ?? '').toString().trim() !== '') {
       console.log(`Webhook: ${articleId} is image-push, skipping`);
       return res.status(200).json({ status: 'skipped', reason: 'image_push' });
     }
 
-    // Filter 2: help-enabled flag must match the configured value.
-    if (article) {
-      const flag = (article[mapping.helpEnabledField] ?? '').toString().trim();
-      if (flag.toUpperCase() !== mapping.helpEnabledValue.toUpperCase()) {
-        console.log(`Webhook: ${articleId} help disabled (${mapping.helpEnabledField}=${flag}), skipping`);
-        return res.status(200).json({ status: 'skipped', reason: 'help_disabled' });
-      }
+    // Filter 2: help-enabled flag must be present AND match the configured value.
+    // Missing field or mismatched value both count as "help not enabled" → drop.
+    const flag = (article[mapping.helpEnabledField] ?? '').toString().trim();
+    if (flag === '' || flag.toUpperCase() !== mapping.helpEnabledValue.toUpperCase()) {
+      const reason = flag === '' ? 'help_field_missing' : 'help_disabled';
+      console.log(`Webhook: ${articleId} ${reason} (${mapping.helpEnabledField}=${JSON.stringify(flag)}), skipping`);
+      return res.status(200).json({ status: 'skipped', reason });
     }
 
-    // Build the message. Article-driven when available; fall back to articleId so
-    // staff still get an alert if Solum was unreachable for the fetch.
-    let alertMessage;
-    if (article) {
-      const name  = (article[mapping.articleNameField] || articleId || labelCode).toString();
-      const aisle = mapping.aisleField
-        ? (article[mapping.aisleField] ?? '').toString().trim()
-        : '';
-      alertMessage = aisle ? `Help needed for ${name} - ${aisle}` : `Help needed for ${name}`;
-    } else {
-      const fallback = articleId || labelCode || 'unknown';
-      alertMessage = `Help needed for ${fallback}`;
-    }
+    // Build the message from the article record.
+    const name  = (article[mapping.articleNameField] || articleId || labelCode).toString();
+    const aisle = mapping.aisleField
+      ? (article[mapping.aisleField] ?? '').toString().trim()
+      : '';
+    const alertMessage = aisle ? `Help needed for ${name} - ${aisle}` : `Help needed for ${name}`;
 
     // New button press — clear any stale acknowledgement so it can be acknowledged fresh
     if (labelCode) acknowledgements.delete(labelCode);
