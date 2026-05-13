@@ -438,7 +438,11 @@ async function handleWebhook(req, res) {
     const flag = (article[mapping.helpEnabledField] ?? '').toString().trim();
     if (flag === '' || flag.toUpperCase() !== mapping.helpEnabledValue.toUpperCase()) {
       const reason = flag === '' ? 'help_field_missing' : 'help_disabled';
-      console.log(`Webhook: ${articleId} ${reason} (${mapping.helpEnabledField}=${JSON.stringify(flag)}), skipping`);
+      console.log(
+        `Webhook: ${articleId} ${reason} ` +
+        `article["${mapping.helpEnabledField}"]=${JSON.stringify(flag)} ` +
+        `configured=${JSON.stringify(mapping.helpEnabledValue)}, skipping`
+      );
       return res.status(200).json({ status: 'skipped', reason });
     }
 
