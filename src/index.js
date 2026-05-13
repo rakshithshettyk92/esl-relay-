@@ -370,6 +370,13 @@ async function handleWebhook(req, res) {
       return res.status(200).json({ status: 'dropped', reason: 'missing company/store' });
     }
 
+    // Filter 0: Solum uses the sentinel articleId "imagepush" for image-push
+    // events on a label. Drop without hitting Solum — saves an API call.
+    if (articleId.toLowerCase() === 'imagepush') {
+      console.log(`Webhook: ${articleId} sentinel — image-push event, skipping`);
+      return res.status(200).json({ status: 'skipped', reason: 'image_push_sentinel' });
+    }
+
     const mapping = getFieldMapping(companyCode, storeCode);
     const article = await fetchArticle(companyCode, storeCode, articleId, mapping);
 
