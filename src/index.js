@@ -1,4 +1,6 @@
 require('dotenv').config();
+const fs   = require('fs');
+const path = require('path');
 const express = require('express');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getMessaging } = require('firebase-admin/messaging');
@@ -35,6 +37,59 @@ let tokenCache = {
 // Entries expire after ACKNOWLEDGE_TTL_MS so the label can be called again later.
 const ACKNOWLEDGE_TTL_MS = 1 * 60 * 1000; // 1 minute (testing)
 const acknowledgements = new Map(); // labelCode → { timestamp, by }
+
+// ===========================================================================
+// Per-store field mapping
+// Mapping tells the relay which columns in the Solum article response to read
+// for product name, aisle, and the "help-enabled" flag. Mappings are pushed by
+// the mobile app's admin screen and persisted to disk so they survive restarts.
+// ===========================================================================
+
+const MAPPINGS_FILE = path.join(__dirname, '..', 'data', 'field-mappings.json');
+
+const DEFAULT_MAPPING = {
+  articleIdField:   'ARTICLE_ID',
+  articleNameField: 'ITEM_NAME',
+  helpEnabledField: 'ASSOCIATE_HELP_ENABLED',
+  helpEnabledValue: 'Y',
+  aisleField:       null,
+};
+
+const fieldMappings = new Map(); // "company:store" → mapping
+
+function mappingKey(companyCode, storeCode) {
+  return `${companyCode}:${storeCode}`;
+}
+
+function getFieldMapping(companyCode, storeCode) {
+  return fieldMappings.get(mappingKey(companyCode, storeCode)) || DEFAULT_MAPPING;
+}
+
+function loadMappings() {
+  try {
+    if (!fs.existsSync(MAPPINGS_FILE)) return;
+    const raw = fs.readFileSync(MAPPINGS_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    for (const [key, mapping] of Object.entries(obj)) {
+      fieldMappings.set(key, mapping);
+    }
+    console.log(`Mappings: loaded ${fieldMappings.size} entries from ${MAPPINGS_FILE}`);
+  } catch (err) {
+    console.error('Mappings: failed to load:', err.message);
+  }
+}
+
+function saveMappings() {
+  try {
+    fs.mkdirSync(path.dirname(MAPPINGS_FILE), { recursive: true });
+    const obj = Object.fromEntries(fieldMappings);
+    fs.writeFileSync(MAPPINGS_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) {
+    console.error('Mappings: failed to save:', err.message);
+  }
+}
+
+
 
 // ===========================================================================
 // ESL Auth — Token Management
@@ -162,6 +217,56 @@ async function blinkLed(companyCode, labelCode) {
   return data;
 }
 
+// Fetches one article's data from Solum so the relay can apply the help-enabled
+// filter and build a human-readable notification message. Returns null on any
+// failure — callers fall back to the legacy "Customer help needed" path.
+async function fetchArticle(companyCode, storeCode, articleId, mapping) {
+  if (!articleId) return null;
+
+  const dataFields = [
+    mapping.articleIdField,
+    mapping.articleNameField,
+    mapping.helpEnabledField,
+    'IMAGE_URL',
+  ];
+  if (mapping.aisleField) dataFields.push(mapping.aisleField);
+
+  const filter = `{articleList[articleId,data[${dataFields.join(',')}]]}`;
+  const query  = new URLSearchParams({
+    company: companyCode,
+    store:   storeCode,
+    filter,
+    page:    '0',
+    size:    '1',
+  });
+
+  try {
+    const token = await getAccessToken(companyCode);
+    const resp  = await fetch(`${ESL_BASE_URL}/api/v2/common/config/article/info?${query}`, {
+      method: 'GET',
+      headers: {
+        'accept':        'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+    });
+
+    const json = await resp.json();
+    const list = json.articleList || [];
+    // Solum returns matches for any article — find the one we asked for.
+    const found = list.find(a => a.articleId === articleId) || list[0];
+    return found ? (found.data || {}) : null;
+  } catch (err) {
+    console.error(`Article fetch failed for ${articleId}:`, err.message);
+    return null;
+  }
+}
+
+// Sanitizes a string for use in an FCM topic name. FCM allows [A-Za-z0-9-_.~%]
+// only, so we replace everything else with underscore.
+function fcmSafeTopic(parts) {
+  return parts.map(p => String(p).replace(/[^A-Za-z0-9_~.%-]/g, '_')).join('-');
+}
+
 async function triggerEslActions(companyCode, labelCode) {
   try {
     await flipPage(companyCode, labelCode, 2);
@@ -254,31 +359,67 @@ async function handleWebhook(req, res) {
     console.log('Webhook received:', JSON.stringify(body));
 
     const companyCode = body.customerCode ?? '';
+    const storeCode   = body.storeCode    ?? '';
     const eventInfo   = Array.isArray(body.eventInfo) ? body.eventInfo[0] : {};
     const labelCode   = eventInfo.labelCode  ?? '';
-    const button      = eventInfo.button     ?? '';
-    const articleIds  = Array.isArray(eventInfo.articleIds)
-      ? eventInfo.articleIds.join(', ')
-      : (eventInfo.articleIds ?? '');
+    const articleIds  = Array.isArray(eventInfo.articleIds) ? eventInfo.articleIds : [];
+    const articleId   = articleIds[0] ?? '';
 
-    const aisle        = articleIds || labelCode;
-    const alertMessage = aisle ? `Customer help needed in ${aisle}` : 'Customer help needed';
+    if (!companyCode || !storeCode) {
+      console.warn('Webhook missing customerCode/storeCode — cannot route, dropping.');
+      return res.status(200).json({ status: 'dropped', reason: 'missing company/store' });
+    }
+
+    const mapping = getFieldMapping(companyCode, storeCode);
+    const article = await fetchArticle(companyCode, storeCode, articleId, mapping);
+
+    // Filter 1: image-push articles are display labels, never customer calls.
+    if (article && (article.IMAGE_URL ?? '').toString().trim() !== '') {
+      console.log(`Webhook: ${articleId} is image-push, skipping`);
+      return res.status(200).json({ status: 'skipped', reason: 'image_push' });
+    }
+
+    // Filter 2: help-enabled flag must match the configured value.
+    if (article) {
+      const flag = (article[mapping.helpEnabledField] ?? '').toString().trim();
+      if (flag.toUpperCase() !== mapping.helpEnabledValue.toUpperCase()) {
+        console.log(`Webhook: ${articleId} help disabled (${mapping.helpEnabledField}=${flag}), skipping`);
+        return res.status(200).json({ status: 'skipped', reason: 'help_disabled' });
+      }
+    }
+
+    // Build the message. Article-driven when available; fall back to articleId so
+    // staff still get an alert if Solum was unreachable for the fetch.
+    let alertMessage;
+    if (article) {
+      const name  = (article[mapping.articleNameField] || articleId || labelCode).toString();
+      const aisle = mapping.aisleField
+        ? (article[mapping.aisleField] ?? '').toString().trim()
+        : '';
+      alertMessage = aisle ? `Help needed for ${name} - ${aisle}` : `Help needed for ${name}`;
+    } else {
+      const fallback = articleId || labelCode || 'unknown';
+      alertMessage = `Help needed for ${fallback}`;
+    }
 
     // New button press — clear any stale acknowledgement so it can be acknowledged fresh
     if (labelCode) acknowledgements.delete(labelCode);
 
+    const topic = fcmSafeTopic(['employee-calls', companyCode, storeCode]);
+
     const fcmResult = await getMessaging().send({
-      topic: process.env.FCM_TOPIC || 'employee-calls',
+      topic,
       data: {
         title:       'Employee Call',
         message:     alertMessage,
         companyCode,           // passed back to app so it can call /esl/acknowledge
+        storeCode,
         labelCode,
         payload:     JSON.stringify(body),
       },
       android: { priority: 'high', ttl: 60000 },
     });
-    console.log('FCM sent:', fcmResult);
+    console.log(`FCM sent (topic=${topic}):`, fcmResult);
 
     // Respond immediately — ESL actions only fire when user taps "On My Way" in the app
     res.status(200).json({ status: 'ok', messageId: fcmResult });
@@ -293,9 +434,9 @@ app.post('/webhook', validateAuth, handleWebhook);
 
 // "On My Way" — triggered by the mobile app when user acknowledges the call
 app.post('/esl/acknowledge', validateAuth, async (req, res) => {
-  const { companyCode, labelCode } = req.body ?? {};
-  if (!companyCode || !labelCode) {
-    return res.status(400).json({ error: 'companyCode and labelCode are required' });
+  const { companyCode, storeCode, labelCode } = req.body ?? {};
+  if (!companyCode || !storeCode || !labelCode) {
+    return res.status(400).json({ error: 'companyCode, storeCode and labelCode are required' });
   }
 
   // Check if already acknowledged within the TTL window
@@ -310,11 +451,12 @@ app.post('/esl/acknowledge', validateAuth, async (req, res) => {
 
   // Mark as acknowledged
   acknowledgements.set(labelCode, { timestamp: Date.now() });
-  console.log(`ESL: Acknowledge from app — ${companyCode} / ${labelCode}`);
+  console.log(`ESL: Acknowledge from app — ${companyCode} / ${storeCode} / ${labelCode}`);
 
-  // Push a cancel message to dismiss the popup on all other devices
+  // Push a cancel message to dismiss the popup on all other devices in this store
+  const topic = fcmSafeTopic(['employee-calls', companyCode, storeCode]);
   getMessaging().send({
-    topic: process.env.FCM_TOPIC || 'employee-calls',
+    topic,
     data: {
       type:      'cancel',
       labelCode,
@@ -326,6 +468,85 @@ app.post('/esl/acknowledge', validateAuth, async (req, res) => {
   triggerEslActions(companyCode, labelCode); // runs in background
 });
 
+// ===========================================================================
+// Admin Routes — used by the mobile app's setup screens
+// ===========================================================================
+
+// List stores for a company. Proxies Solum so the app doesn't need its own token.
+app.get('/admin/stores', validateAuth, async (req, res) => {
+  const company = (req.query.company ?? '').toString().trim();
+  if (!company) return res.status(400).json({ error: 'company is required' });
+
+  try {
+    const token = await getAccessToken(company);
+    const resp  = await fetch(`${ESL_BASE_URL}/api/v2/common/store?company=${encodeURIComponent(company)}`, {
+      method: 'GET',
+      headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
+    });
+    const json = await resp.json();
+    res.status(resp.status).json(json);
+  } catch (err) {
+    console.error('Admin: stores fetch failed:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Fetch the article column schema so the admin screen can populate dropdowns.
+app.get('/admin/articles/upload/format', validateAuth, async (req, res) => {
+  const company = (req.query.company ?? '').toString().trim();
+  if (!company) return res.status(400).json({ error: 'company is required' });
+
+  try {
+    const token = await getAccessToken(company);
+    const resp  = await fetch(`${ESL_BASE_URL}/api/v2/common/articles/upload/format?company=${encodeURIComponent(company)}`, {
+      method: 'GET',
+      headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
+    });
+    const json = await resp.json();
+    res.status(resp.status).json(json);
+  } catch (err) {
+    console.error('Admin: format fetch failed:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Read the saved field mapping for one company/store. Returns DEFAULT_MAPPING
+// when nothing is saved yet, so the admin screen always has something to show.
+app.get('/admin/field-mapping', validateAuth, (req, res) => {
+  const company = (req.query.company ?? '').toString().trim();
+  const store   = (req.query.store   ?? '').toString().trim();
+  if (!company || !store) {
+    return res.status(400).json({ error: 'company and store are required' });
+  }
+  const mapping = fieldMappings.get(mappingKey(company, store)) || DEFAULT_MAPPING;
+  const saved   = fieldMappings.has(mappingKey(company, store));
+  res.json({ mapping, saved });
+});
+
+app.post('/admin/field-mapping', validateAuth, (req, res) => {
+  const { company, store, mapping } = req.body ?? {};
+  if (!company || !store || !mapping) {
+    return res.status(400).json({ error: 'company, store and mapping are required' });
+  }
+  const required = ['articleIdField', 'articleNameField', 'helpEnabledField', 'helpEnabledValue'];
+  for (const field of required) {
+    if (!mapping[field] || typeof mapping[field] !== 'string') {
+      return res.status(400).json({ error: `mapping.${field} is required` });
+    }
+  }
+  const clean = {
+    articleIdField:   mapping.articleIdField.trim(),
+    articleNameField: mapping.articleNameField.trim(),
+    helpEnabledField: mapping.helpEnabledField.trim(),
+    helpEnabledValue: mapping.helpEnabledValue.trim(),
+    aisleField:       (mapping.aisleField || '').toString().trim() || null,
+  };
+  fieldMappings.set(mappingKey(company, store), clean);
+  saveMappings();
+  console.log(`Admin: saved mapping for ${company}/${store}`);
+  res.json({ status: 'ok', mapping: clean });
+});
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'running', timestamp: new Date().toISOString() });
 });
@@ -334,4 +555,5 @@ app.get('/health', (_req, res) => {
 // Start
 // ===========================================================================
 const PORT = process.env.PORT || 3000;
+loadMappings();
 app.listen(PORT, () => console.log(`ESL Relay listening on port ${PORT}`));
