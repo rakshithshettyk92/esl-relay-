@@ -410,9 +410,22 @@ app.get('/auth/status', validateAuth, (req, res) => {
 // ===========================================================================
 
 async function handleWebhook(req, res) {
+  // Acknowledge immediately so Solum doesn't retry on a slow article fetch.
+  // Real processing runs after the response is sent.
+  res.status(200).json({ status: 'accepted' });
+
   try {
     const body = req.body ?? {};
     console.log('Webhook received:', JSON.stringify(body));
+
+    // Solum emits many webhook types — pageStatus, ledStatus, etc. — that are
+    // status echoes of API calls the relay itself made (flipPage, blinkLed).
+    // Only "buttonPress" represents an actual customer action; everything
+    // else is noise that previously fired duplicate alerts.
+    if (body.type && body.type !== 'buttonPress') {
+      console.log(`Webhook: type=${body.type} — not a button press, skipping`);
+      return;
+    }
 
     const companyCode = body.customerCode ?? '';
     const storeCode   = body.storeCode    ?? '';
@@ -423,14 +436,14 @@ async function handleWebhook(req, res) {
 
     if (!companyCode || !storeCode) {
       console.warn('Webhook missing customerCode/storeCode — cannot route, dropping.');
-      return res.status(200).json({ status: 'dropped', reason: 'missing company/store' });
+      return;
     }
 
     // Filter 0: Solum uses the sentinel articleId "imagepush" for image-push
     // events on a label. Drop without hitting Solum — saves an API call.
     if (articleId.toLowerCase() === 'imagepush') {
       console.log(`Webhook: ${articleId} sentinel — image-push event, skipping`);
-      return res.status(200).json({ status: 'skipped', reason: 'image_push_sentinel' });
+      return;
     }
 
     const mapping = getFieldMapping(companyCode, storeCode);
@@ -440,13 +453,13 @@ async function handleWebhook(req, res) {
     // and the rule is "no alert unless explicitly enabled".
     if (!article) {
       console.warn(`Webhook: ${articleId} article not available, skipping (cannot verify help-enabled)`);
-      return res.status(200).json({ status: 'skipped', reason: 'article_unavailable' });
+      return;
     }
 
     // Filter 1: image-push articles are display labels, never customer calls.
     if ((article.IMAGE_URL ?? '').toString().trim() !== '') {
       console.log(`Webhook: ${articleId} is image-push, skipping`);
-      return res.status(200).json({ status: 'skipped', reason: 'image_push' });
+      return;
     }
 
     // Filter 2: help-enabled flag must be present AND match the configured value.
@@ -459,7 +472,7 @@ async function handleWebhook(req, res) {
         `article["${mapping.helpEnabledField}"]=${JSON.stringify(flag)} ` +
         `configured=${JSON.stringify(mapping.helpEnabledValue)}, skipping`
       );
-      return res.status(200).json({ status: 'skipped', reason });
+      return;
     }
 
     // Build the message from the article record.
@@ -500,12 +513,9 @@ async function handleWebhook(req, res) {
       articleName:  name,
       aisle:        aisle || null,
     });
-
-    // Respond immediately — ESL actions only fire when user taps "On My Way" in the app
-    res.status(200).json({ status: 'ok', messageId: fcmResult });
   } catch (err) {
-    console.error('Webhook error:', err);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
+    // Response was already sent at the top of the function, so we just log.
+    console.error('Webhook processing failed:', err.message);
   }
 }
 
