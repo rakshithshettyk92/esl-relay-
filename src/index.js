@@ -257,8 +257,12 @@ async function blinkLed(companyCode, labelCode) {
 }
 
 // Fetches one article's data from Solum so the relay can apply the help-enabled
-// filter and build a human-readable notification message. Returns null on any
-// failure — callers fall back to the legacy "Customer help needed" path.
+// filter and build a human-readable notification message. Returns null when
+// the specific articleId can't be located (caller treats that as a skip).
+//
+// Solum's /article/info endpoint doesn't support querying by articleId in the
+// filter syntax — it returns paginated results sorted by articleId — so we
+// page through until we find the one we want. Capped to avoid runaway scans.
 async function fetchArticle(companyCode, storeCode, articleId, mapping) {
   if (!articleId) return null;
 
@@ -270,30 +274,42 @@ async function fetchArticle(companyCode, storeCode, articleId, mapping) {
   ];
   if (mapping.aisleField) dataFields.push(mapping.aisleField);
 
-  const filter = `{articleList[articleId,data[${dataFields.join(',')}]]}`;
-  const query  = new URLSearchParams({
-    company: companyCode,
-    store:   storeCode,
-    filter,
-    page:    '0',
-    size:    '1',
-  });
+  const filter   = `{articleList[articleId,data[${dataFields.join(',')}]]}`;
+  const pageSize = 200;
+  const maxPages = 25;   // hard cap: 5,000 articles per store
 
   try {
     const token = await getAccessToken(companyCode);
-    const resp  = await fetch(`${ESL_BASE_URL}/api/v2/common/config/article/info?${query}`, {
-      method: 'GET',
-      headers: {
-        'accept':        'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
-    });
 
-    const json = await resp.json();
-    const list = json.articleList || [];
-    // Solum returns matches for any article — find the one we asked for.
-    const found = list.find(a => a.articleId === articleId) || list[0];
-    return found ? (found.data || {}) : null;
+    for (let page = 0; page < maxPages; page++) {
+      const query = new URLSearchParams({
+        company: companyCode,
+        store:   storeCode,
+        sort:    'articleId,asc',
+        filter,
+        page:    String(page),
+        size:    String(pageSize),
+      });
+
+      const resp = await fetch(`${ESL_BASE_URL}/api/v2/common/config/article/info?${query}`, {
+        method: 'GET',
+        headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
+      });
+
+      const json = await resp.json();
+      const list = json.articleList || [];
+      if (list.length === 0) break;
+
+      // EXACT match only — never fall back to a sibling article.
+      const found = list.find(a => a.articleId === articleId);
+      if (found) return found.data || {};
+
+      // Last page reached without a match.
+      if (list.length < pageSize) break;
+    }
+
+    console.warn(`Article ${articleId} not found in ${companyCode}/${storeCode}`);
+    return null;
   } catch (err) {
     console.error(`Article fetch failed for ${articleId}:`, err.message);
     return null;
