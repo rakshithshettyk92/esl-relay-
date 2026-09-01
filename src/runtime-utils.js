@@ -19,4 +19,16 @@ function usableTokenLifetimeMs(expiresIn, bufferSeconds) {
   return Math.max(1, lifetimeSeconds - safeBuffer) * 1000;
 }
 
-module.exports = { boundedInt, fcmSafeTopic, usableTokenLifetimeMs };
+function articleCacheKey(companyCode, storeCode, articleId, mapping = {}) {
+  return JSON.stringify([
+    companyCode,
+    storeCode,
+    articleId,
+    mapping.articleIdField || '',
+    mapping.articleNameField || '',
+    mapping.helpEnabledField || '',
+    mapping.aisleField || '',
+  ]);
+}
+
+module.exports = { boundedInt, fcmSafeTopic, usableTokenLifetimeMs, articleCacheKey };

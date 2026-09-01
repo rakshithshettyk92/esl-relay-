@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getMessaging } = require('firebase-admin/messaging');
-const { boundedInt, usableTokenLifetimeMs } = require('./runtime-utils');
+const { boundedInt, usableTokenLifetimeMs, articleCacheKey } = require('./runtime-utils');
 const database = require('./database');
 const { installLogCapture, connectLogPersistence, mountOps } = require('./ops');
 
@@ -368,7 +368,10 @@ async function blinkLed(companyCode, storeCode, labelCode, preferredSessionId = 
 // page through until we find the one we want. Capped to avoid runaway scans.
 async function fetchArticle(companyCode, storeCode, articleId, mapping) {
   if (!articleId) return null;
-  const cacheKey = `${companyCode}:${storeCode}:${articleId}`;
+  // The AIMS response only contains the fields requested by the active mapping.
+  // Include those field names in the key so a mapping change cannot reuse an
+  // article cached with a different (and therefore incomplete) projection.
+  const cacheKey = articleCacheKey(companyCode, storeCode, articleId, mapping);
   const cached = articleCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.article;
   const deadline = Date.now() + ARTICLE_LOOKUP_TIMEOUT_MS;
@@ -903,6 +906,9 @@ app.post('/admin/field-mapping', requireSession, (req, res) => {
     revertDelaySeconds: Math.max(5, Math.min(600, Number.isFinite(rawDelay) ? rawDelay : 60)),
   };
   fieldMappings.set(mappingKey(company, store), clean);
+  // Mapping changes must take effect on the very next button press. Clearing
+  // this small bounded cache avoids retaining projections created beforehand.
+  articleCache.clear();
   saveMappings();
   console.log(`Admin: saved mapping for ${company}/${store}`);
   res.json({ status: 'ok', mapping: clean });
