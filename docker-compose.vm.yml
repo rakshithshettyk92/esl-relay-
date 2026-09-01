@@ -69,6 +69,7 @@ services:
         condition: service_healthy
     networks:
       - esl_internal
+      - esl_edge
     security_opt:
       - no-new-privileges:true
     healthcheck:
@@ -84,6 +85,7 @@ services:
 networks:
   esl_internal:
     internal: true
+  esl_edge:
 
 volumes:
   esl_postgres_data:
