@@ -3,18 +3,24 @@ set -euo pipefail
 
 base_url="${1:-https://127.0.0.1}"
 env_file="${2:-$HOME/esl-relay/.env.vm}"
-ops_user="$(grep '^OPS_USERNAME=' "$env_file" | cut -d= -f2-)"
-ops_password="$(grep '^OPS_PASSWORD=' "$env_file" | cut -d= -f2-)"
+ops_user="$(grep '^OPS_USERNAME=' "$env_file" | cut -d= -f2- | tr -d '\r')"
+ops_password="$(grep '^OPS_PASSWORD=' "$env_file" | cut -d= -f2- | tr -d '\r')"
 cookie_file="$(mktemp)"
-trap 'rm -f "$cookie_file"' EXIT
+headers_file="$(mktemp)"
+trap 'rm -f "$cookie_file" "$headers_file"' EXIT
 
 health="$(curl -kfsS "$base_url/health")"
 jq -e '.status == "running" and .database.connected == true' <<<"$health" >/dev/null
 
-login_code="$(curl -ksS -c "$cookie_file" -o /dev/null -w '%{http_code}' \
+login_code="$(curl -ksS -D "$headers_file" -c "$cookie_file" -o /dev/null -w '%{http_code}' \
   --data-urlencode "username=$ops_user" --data-urlencode "password=$ops_password" \
   "$base_url/ops/login")"
 [[ "$login_code" == "302" ]] || { echo "Dashboard login returned HTTP $login_code" >&2; exit 1; }
+login_location="$(awk 'tolower($1) == "location:" {gsub("\r", "", $2); print $2}' "$headers_file" | tail -n1)"
+[[ "$login_location" == "/ops" ]] || {
+  echo "Dashboard rejected the configured admin credentials (redirected to $login_location)" >&2
+  exit 1
+}
 
 status="$(curl -kfsS -b "$cookie_file" "$base_url/ops/api/status")"
 jq -e '.status == "running" and .database.connected == true and .retentionDays == 7' \

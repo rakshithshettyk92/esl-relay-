@@ -77,7 +77,7 @@ if (-not $hasRemoteEnv) {
         [IO.File]::WriteAllLines($bootstrap, $lines, (New-Object Text.UTF8Encoding($false)))
         scp -i $KeyPath $bootstrap "${remote}:esl-relay/.env.vm.new"
         if ($LASTEXITCODE -ne 0) { throw 'Could not upload the initial VM environment.' }
-        ssh -i $KeyPath -o BatchMode=yes $remote "chmod 600 $remoteRoot/.env.vm.new && mv $remoteRoot/.env.vm.new $remoteRoot/.env.vm"
+        ssh -i $KeyPath -o BatchMode=yes $remote "sed -i 's/\r$//' $remoteRoot/.env.vm.new && chmod 600 $remoteRoot/.env.vm.new && mv $remoteRoot/.env.vm.new $remoteRoot/.env.vm"
         if ($LASTEXITCODE -ne 0) { throw 'Could not install the VM environment.' }
     }
     finally {
