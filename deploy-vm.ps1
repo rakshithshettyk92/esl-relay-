@@ -88,10 +88,10 @@ if (-not $hasRemoteEnv) {
 scp -i $KeyPath $archive "${remote}:esl-relay/releases/$release/source.tar"
 if ($LASTEXITCODE -ne 0) { throw 'Could not upload the relay release archive.' }
 
-$deploy = "set -e; cd $remoteRelease; tar -xf source.tar; sed -i 's/\r$//' tools/*.sh; ln -s $remoteRoot/.env.vm .env.vm; sudo test -f /etc/letsencrypt/live/$HostName/fullchain.pem; sudo docker compose -p esl-relay --env-file $remoteRoot/.env.vm -f docker-compose.vm.yml up -d --build --wait --wait-timeout 240; ln -sfn $remoteRelease $remoteRoot/current; bash tools/prune-releases.sh $remoteRoot 8; curl --fail --silent --show-error --insecure https://127.0.0.1:8443/health >/dev/null"
+$deploy = "set -e; cd $remoteRelease; tar -xf source.tar; sed -i 's/\r$//' tools/*.sh; ln -s $remoteRoot/.env.vm .env.vm; sudo docker network inspect solum_apps >/dev/null; sudo docker compose -p esl-relay --env-file $remoteRoot/.env.vm -f docker-compose.vm.yml up -d --build --wait --wait-timeout 240; sudo docker compose -p esl-relay --env-file $remoteRoot/.env.vm -f docker-compose.vm.yml exec -T relay wget -qO- http://127.0.0.1:3000/health >/dev/null; ln -sfn $remoteRelease $remoteRoot/current; bash tools/prune-releases.sh $remoteRoot 8"
 ssh -i $KeyPath -o BatchMode=yes $remote $deploy
 if ($LASTEXITCODE -ne 0) { throw 'ESL Relay deployment failed.' }
 
-Write-Host "ESL Relay deployed to https://$HostName`:8443/"
-Write-Host "Operations page: https://$HostName`:8443/ops"
+Write-Host "ESL Relay deployed behind the shared HTTPS gateway at https://$HostName/"
+Write-Host "Operations page: https://$HostName/ops"
 Write-Host "Secrets remain in $remoteRoot/.env.vm with mode 600."

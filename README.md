@@ -19,7 +19,7 @@ AIMS account and the webhook secret is never included in the Android APK.
 
 The production demo stack is defined by `docker-compose.vm.yml`:
 
-- Nginx HTTPS gateway on host port `8443`.
+- Shared app-launcher Nginx gateway on the existing host HTTPS port `443`.
 - Node relay on a private Docker network.
 - PostgreSQL 16 on the same private network with no published port.
 - Named volumes for PostgreSQL and durable relay jobs/mappings.
@@ -38,7 +38,7 @@ stores them in `~/esl-relay/.env.vm` on the VM with mode `600`.
 
 | Field | Value |
 |---|---|
-| URL | `https://20.121.68.137:8443/webhook` |
+| URL | `https://20.121.68.137/webhook` |
 | Authentication Key Header | `x-auth-key` |
 | Authentication Key Value | VM `AUTH_KEY` value |
 | API Timeout | 10 seconds (30 seconds is also safe) |
@@ -48,14 +48,14 @@ The endpoint responds `202 Accepted` after durably queueing the request.
 
 ## Employee Call Operation
 
-Open `https://20.121.68.137:8443/ops`. The dashboard has its own database-backed
+Open `https://20.121.68.137/ops`. The dashboard has its own database-backed
 admin login and displays service/database health, active sessions, registered
 devices, queued jobs, recent calls, and redacted application logs. Logs shown
 by the dashboard are retained in PostgreSQL for seven days.
 
 ## Android app
 
-The Android client uses `https://20.121.68.137:8443` by default. After login and
+The Android client uses `https://20.121.68.137` by default. After login and
 store selection it registers its exact FCM token with the relay. Calls are sent
 only to devices registered to that company/store, and PostgreSQL atomically
 ensures that only the first associate can claim a call.
