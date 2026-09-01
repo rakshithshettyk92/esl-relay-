@@ -23,6 +23,25 @@ Copy `.env.example` to `.env` and fill in the values.
 
 On Railway, set these under **Variables** in the project dashboard.
 
+For reliable unattended operation, set `ESL_USERNAME` and `ESL_PASSWORD` as
+Railway variables. This lets the relay obtain a fresh Solum token after a
+restart or after the persisted refresh token expires. The password is retained
+only in the Railway environment and is never written to the relay data files.
+
+Mount a Railway Volume at `/app/data` and set `DATA_DIR=/app/data`. The relay
+stores refresh tokens, per-store field mappings, and analytics there; without a
+volume those files are lost during a redeploy.
+
+Operational timing is configurable with `ESL_REQUEST_TIMEOUT_MS`,
+`TOKEN_REFRESH_BUFFER_SECONDS`, `ARTICLE_LOOKUP_TIMEOUT_MS`,
+`ARTICLE_CACHE_TTL_SECONDS`, and `ACKNOWLEDGE_TTL_SECONDS`. See
+`.env.example` for defaults.
+
+Webhook processing, acknowledgement deduplication, and scheduled ESL page
+reverts are persisted under `DATA_DIR` and automatically resumed after a
+restart. Run only one relay instance when using this file-backed queue; use a
+shared database/queue before scaling Railway to multiple replicas.
+
 ### 3. Configure AIMS
 
 | Field | Value |
@@ -34,8 +53,9 @@ On Railway, set these under **Variables** in the project dashboard.
 ### 4. Android app
 
 Open the `ESLCallApp` Android project in Android Studio.
-The app subscribes to the `employee-calls` FCM topic on first launch —
-no extra config needed.
+The app subscribes to the selected store's `employee-calls` FCM topic.
+Signing out of one phone is device-local and does not terminate the relay's
+shared Solum session for other phones.
 
 ## Local dev
 
