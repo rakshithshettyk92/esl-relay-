@@ -1,10 +1,15 @@
 require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getMessaging } = require('firebase-admin/messaging');
-const { boundedInt, fcmSafeTopic, usableTokenLifetimeMs } = require('./runtime-utils');
+const { boundedInt, usableTokenLifetimeMs } = require('./runtime-utils');
+const database = require('./database');
+const { installLogCapture, connectLogPersistence, mountOps } = require('./ops');
+
+installLogCapture();
 
 // ---------------------------------------------------------------------------
 // Firebase init
@@ -14,17 +19,17 @@ initializeApp({ credential: cert(serviceAccount) });
 
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '64kb' }));
+const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 
 function envInt(name, fallback, min, max) {
   return boundedInt(process.env[name], fallback, min, max);
 }
 
 // ===========================================================================
-// In-memory state
-// Credentials come from Railway variables when configured, or can be set via
-// POST /auth/login from the mobile app.
-// Tokens are cached and auto-refreshed; the password is never written to disk.
+// Runtime configuration and bounded in-memory caches.
+// Associate sessions and encrypted AIMS tokens live in PostgreSQL.
 // ===========================================================================
 
 const ESL_BASE_URL = process.env.ESL_BASE_URL || 'https://eastus.common.solumesl.com/common';
@@ -33,56 +38,8 @@ const ESL_REQUEST_TIMEOUT_MS = envInt('ESL_REQUEST_TIMEOUT_MS', 20_000, 1_000, 1
 const TOKEN_REFRESH_BUFFER_SECONDS = envInt('TOKEN_REFRESH_BUFFER_SECONDS', 300, 0, 3_600);
 const ARTICLE_LOOKUP_TIMEOUT_MS = envInt('ARTICLE_LOOKUP_TIMEOUT_MS', 30_000, 5_000, 120_000);
 const ARTICLE_CACHE_TTL_MS = envInt('ARTICLE_CACHE_TTL_SECONDS', 300, 0, 3_600) * 1000;
-const ENV_ESL_USERNAME = process.env.ESL_USERNAME?.trim() || null;
-const ENV_ESL_PASSWORD = process.env.ESL_PASSWORD || null;
-
-let credentials = {
-  username: ENV_ESL_USERNAME,
-  password: ENV_ESL_PASSWORD,
-};
-
-let tokenCache = {
-  accessToken:  null,
-  refreshToken: null,
-  expiresAt:    null,
-};
-
-let authHealth = {
-  lastSuccessAt: null,
-  lastError: null,
-};
-let tokenPromise = null;
 const articleCache = new Map();
-
-// Tracks which labelCodes have already been acknowledged and by whom.
-// Entries expire after ACKNOWLEDGE_TTL_MS so the label can be called again later.
-const ACKNOWLEDGE_TTL_MS = envInt('ACKNOWLEDGE_TTL_SECONDS', 60, 5, 3_600) * 1000;
-const ACKNOWLEDGEMENTS_FILE = path.join(DATA_DIR, 'acknowledgements.json');
-
-function acknowledgementKey(companyCode, storeCode, labelCode) {
-  return `${companyCode}:${storeCode}:${labelCode}`;
-}
-
-function saveAcknowledgements() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const now = Date.now();
-  for (const [key, value] of acknowledgements) {
-    if (!value?.timestamp || now - value.timestamp >= ACKNOWLEDGE_TTL_MS) acknowledgements.delete(key);
-  }
-  fs.writeFileSync(ACKNOWLEDGEMENTS_FILE, JSON.stringify(Object.fromEntries(acknowledgements), null, 2));
-}
-
-function loadAcknowledgements() {
-  try {
-    if (!fs.existsSync(ACKNOWLEDGEMENTS_FILE)) return;
-    const stored = JSON.parse(fs.readFileSync(ACKNOWLEDGEMENTS_FILE, 'utf8'));
-    for (const [key, value] of Object.entries(stored)) acknowledgements.set(key, value);
-    saveAcknowledgements();
-  } catch (err) {
-    console.error('Acknowledgements: failed to load:', err.message);
-  }
-}
-const acknowledgements = new Map(); // labelCode → { timestamp, by }
+const sessionTokenPromises = new Map();
 
 // ===========================================================================
 // Per-store field mapping
@@ -133,65 +90,6 @@ function saveMappings() {
     fs.writeFileSync(MAPPINGS_FILE, JSON.stringify(obj, null, 2));
   } catch (err) {
     console.error('Mappings: failed to save:', err.message);
-  }
-}
-
-// ===========================================================================
-// Token persistence — survives Railway redeploys so we don't lose the Solum
-// session every time we push code. Password is NEVER persisted; only the
-// refresh token + username + access token. If the refresh token also expires
-// while the container is down, the app will still need to re-login.
-// ===========================================================================
-
-const TOKENS_FILE = path.join(DATA_DIR, 'relay-tokens.json');
-
-function persistSession() {
-  try {
-    fs.mkdirSync(path.dirname(TOKENS_FILE), { recursive: true });
-    const data = {
-      username: credentials.username,
-      tokenCache: {
-        accessToken:  tokenCache.accessToken,
-        refreshToken: tokenCache.refreshToken,
-        expiresAt:    tokenCache.expiresAt ? tokenCache.expiresAt.toISOString() : null,
-      },
-    };
-    fs.writeFileSync(TOKENS_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error('Tokens: failed to persist:', err.message);
-  }
-}
-
-function loadPersistedSession() {
-  try {
-    if (!fs.existsSync(TOKENS_FILE)) return;
-    const data = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
-    if (ENV_ESL_USERNAME && data.username && data.username !== ENV_ESL_USERNAME) {
-      console.warn('Tokens: persisted username does not match ESL_USERNAME; ignoring stale tokens');
-      return;
-    }
-    if (!credentials.username && data.username) credentials.username = data.username;
-    if (data.tokenCache) {
-      tokenCache = {
-        accessToken:  data.tokenCache.accessToken  ?? null,
-        refreshToken: data.tokenCache.refreshToken ?? null,
-        expiresAt:    data.tokenCache.expiresAt ? new Date(data.tokenCache.expiresAt) : null,
-      };
-    }
-    console.log(
-      `Tokens: restored session for ${credentials.username ?? 'unknown'} ` +
-      `(tokenValid=${!!(tokenCache.accessToken && tokenCache.expiresAt > new Date())})`
-    );
-  } catch (err) {
-    console.error('Tokens: failed to load:', err.message);
-  }
-}
-
-function clearPersistedSession() {
-  try {
-    if (fs.existsSync(TOKENS_FILE)) fs.unlinkSync(TOKENS_FILE);
-  } catch (err) {
-    console.error('Tokens: failed to clear:', err.message);
   }
 }
 
@@ -288,16 +186,20 @@ async function runDueJobs() {
     try {
       if (job.type === 'webhook') await processWebhookBody(job.payload);
       else if (job.type === 'revert') {
-        await flipPage(job.payload.companyCode, job.payload.labelCode, 1);
+        await flipPage(job.payload.companyCode, job.payload.storeCode,
+          job.payload.labelCode, 1, job.payload.sessionId);
       } else if (job.type === 'cancel') {
-        await getMessaging().send({
-          topic: fcmSafeTopic(['employee-calls', job.payload.companyCode, job.payload.storeCode]),
-          data: { type: 'cancel', labelCode: job.payload.labelCode },
+        await sendStoreMessage(job.payload.companyCode, job.payload.storeCode, {
+          data: {
+            type: 'cancel',
+            callId: job.payload.callId || '',
+            labelCode: job.payload.labelCode,
+          },
           android: { priority: 'high', ttl: 30000 },
         });
       } else if (job.type === 'esl-actions') {
-        await triggerEslActions(job.payload.companyCode, job.payload.labelCode,
-          job.payload.revertDelayMs);
+        await triggerEslActions(job.payload.companyCode, job.payload.storeCode,
+          job.payload.labelCode, job.payload.revertDelayMs, job.payload.sessionId);
       }
       jobs.delete(job.id);
     } catch (err) {
@@ -330,23 +232,21 @@ async function fetchWithTimeout(url, options = {}) {
   }
 }
 
-async function loginAndGetToken() {
-  if (!credentials.username || !credentials.password) {
-    throw new Error('Not authenticated. Please log in from the mobile app first.');
-  }
+function normalizeTokens(tokens) {
+  const expiresInMs = usableTokenLifetimeMs(tokens.expires_in, TOKEN_REFRESH_BUFFER_SECONDS);
+  return {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresAt: new Date(Date.now() + expiresInMs),
+  };
+}
 
-  console.log(`ESL Auth: Logging in as ${credentials.username}`);
-
+async function loginWithCredentials(username, password) {
+  console.log(`ESL Auth: validating associate ${username}`);
   const resp = await fetchWithTimeout(`${ESL_BASE_URL}/api/v2/token`, {
     method: 'POST',
-    headers: {
-      'accept':        'application/json',
-      'Content-Type':  'application/json',
-    },
-    body: JSON.stringify({
-      username: credentials.username,
-      password: credentials.password,
-    }),
+    headers: { accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
   });
 
   const data = await resp.json();
@@ -354,13 +254,12 @@ async function loginAndGetToken() {
     throw new Error(`Login failed (${data.responseCode}): ${JSON.stringify(data.responseMessage ?? data)}`);
   }
 
-  storeTokens(data.responseMessage);
-  console.log('ESL Auth: Login successful');
-  return tokenCache.accessToken;
+  return normalizeTokens(data.responseMessage);
 }
 
-async function doRefreshToken(companyCode) {
-  console.log('ESL Auth: Refreshing access token');
+async function refreshSession(session, companyCode) {
+  if (!session.refreshToken) throw new Error('Refresh token expired; please sign in again');
+  console.log(`ESL Auth: refreshing token for ${session.username}`);
 
   const resp = await fetchWithTimeout(`${ESL_BASE_URL}/api/v2/token/refresh?company=${companyCode}`, {
     method: 'POST',
@@ -368,7 +267,7 @@ async function doRefreshToken(companyCode) {
       'accept':        'application/json',
       'Content-Type':  'application/json',
     },
-    body: JSON.stringify({ refreshToken: tokenCache.refreshToken }),
+    body: JSON.stringify({ refreshToken: session.refreshToken }),
   });
 
   const data = await resp.json();
@@ -376,67 +275,54 @@ async function doRefreshToken(companyCode) {
     throw new Error(`Refresh failed (${data.responseCode}): ${JSON.stringify(data.responseMessage ?? data)}`);
   }
 
-  storeTokens(data.responseMessage);
-  console.log('ESL Auth: Token refreshed');
-  return tokenCache.accessToken;
+  const tokens = normalizeTokens(data.responseMessage);
+  await database.saveSessionTokens(session.id, tokens);
+  return tokens.accessToken;
 }
 
-function storeTokens(tokens) {
-  const expiresInMs = usableTokenLifetimeMs(tokens.expires_in, TOKEN_REFRESH_BUFFER_SECONDS);
-  tokenCache = {
-    accessToken:  tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    expiresAt:    new Date(Date.now() + expiresInMs),
-  };
-  authHealth = { lastSuccessAt: new Date().toISOString(), lastError: null };
-  persistSession();
-}
-
-async function getAccessToken(companyCode) {
-  // Use cached token if still valid
-  if (tokenCache.accessToken && tokenCache.expiresAt > new Date()) {
-    return tokenCache.accessToken;
-  }
-  if (tokenPromise) return tokenPromise;
-  tokenPromise = (async () => {
-
-  // Try refresh token
-  if (tokenCache.refreshToken) {
-    try {
-      return await doRefreshToken(companyCode);
-    } catch (err) {
-      console.warn('ESL Auth: Refresh failed, re-logging in:', err.message);
-      tokenCache.refreshToken = null;
-    }
-  }
-
-  // Full login with stored credentials. Password is only in memory (never
-  // persisted), so after a restart with an expired refresh token we end up
-  // here with no password — surface that as a clean signed-out state so the
-  // app's /auth/status check and banner can prompt a re-login.
-  if (!credentials.password) {
-    credentials.username = null;
-    clearPersistedSession();
-    throw new Error('Not authenticated. Please log in from the mobile app first.');
-  }
-    return loginAndGetToken();
-  })();
+async function getSessionAccessToken(sessionId, companyCode) {
+  const session = await database.getSessionById(sessionId);
+  if (!session) throw new Error('Associate session is no longer active; please sign in again');
+  if (session.accessToken && session.accessExpiresAt > new Date()) return session.accessToken;
+  if (sessionTokenPromises.has(sessionId)) return sessionTokenPromises.get(sessionId);
+  const pending = refreshSession(session, companyCode);
+  sessionTokenPromises.set(sessionId, pending);
   try {
-    return await tokenPromise;
+    return await pending;
   } catch (err) {
-    authHealth.lastError = err.message;
+    await database.clearSessionTokens(sessionId);
     throw err;
   } finally {
-    tokenPromise = null;
+    sessionTokenPromises.delete(sessionId);
   }
+}
+
+async function getStoreAccessToken(companyCode, storeCode, preferredSessionId = null) {
+  const candidates = await database.getStoreSessions(companyCode, storeCode);
+  if (preferredSessionId) {
+    candidates.sort((a, b) => (a.id === preferredSessionId ? -1 : b.id === preferredSessionId ? 1 : 0));
+  }
+  if (candidates.length === 0) {
+    throw new Error(`No signed-in associate is registered for ${companyCode}/${storeCode}`);
+  }
+  let lastError;
+  for (const session of candidates) {
+    try {
+      return { token: await getSessionAccessToken(session.id, companyCode), sessionId: session.id };
+    } catch (error) {
+      lastError = error;
+      console.warn(`ESL Auth: ${session.username} unavailable for ${companyCode}/${storeCode}: ${error.message}`);
+    }
+  }
+  throw lastError || new Error('No usable associate session is available');
 }
 
 // ===========================================================================
 // ESL API — Label Actions
 // ===========================================================================
 
-async function flipPage(companyCode, labelCode, page) {
-  const token = await getAccessToken(companyCode);
+async function flipPage(companyCode, storeCode, labelCode, page, preferredSessionId = null) {
+  const { token, sessionId } = await getStoreAccessToken(companyCode, storeCode, preferredSessionId);
   console.log(`ESL: Flipping ${labelCode} → page ${page}`);
 
   const resp = await fetchWithTimeout(`${ESL_BASE_URL}/api/v1/labels/contents/page?company=${companyCode}`, {
@@ -451,11 +337,11 @@ async function flipPage(companyCode, labelCode, page) {
 
   const data = await resp.json();
   console.log(`ESL: Page flip → ${page}:`, JSON.stringify(data));
-  return data;
+  return { data, sessionId };
 }
 
-async function blinkLed(companyCode, labelCode) {
-  const token = await getAccessToken(companyCode);
+async function blinkLed(companyCode, storeCode, labelCode, preferredSessionId = null) {
+  const { token, sessionId } = await getStoreAccessToken(companyCode, storeCode, preferredSessionId);
   console.log(`ESL: Blinking LED on ${labelCode}`);
 
   const resp = await fetchWithTimeout(`${ESL_BASE_URL}/api/v1/labels/contents/led?company=${companyCode}`, {
@@ -470,7 +356,7 @@ async function blinkLed(companyCode, labelCode) {
 
   const data = await resp.json();
   console.log(`ESL: LED blink:`, JSON.stringify(data));
-  return data;
+  return { data, sessionId };
 }
 
 // Fetches one article's data from Solum so the relay can apply the help-enabled
@@ -500,7 +386,7 @@ async function fetchArticle(companyCode, storeCode, articleId, mapping) {
   const maxPages = 25;   // hard cap: 5,000 articles per store
 
   try {
-    const token = await getAccessToken(companyCode);
+    const { token } = await getStoreAccessToken(companyCode, storeCode);
 
     for (let page = 0; page < maxPages; page++) {
       if (Date.now() >= deadline) {
@@ -546,15 +432,16 @@ async function fetchArticle(companyCode, storeCode, articleId, mapping) {
   }
 }
 
-// Sanitizes a string for use in an FCM topic name. FCM allows [A-Za-z0-9-_.~%]
-// only, so we replace everything else with underscore.
-async function triggerEslActions(companyCode, labelCode, revertDelayMs = 60_000) {
+async function triggerEslActions(companyCode, storeCode, labelCode, revertDelayMs = 60_000,
+  preferredSessionId = null) {
   let pageFlipped = false;
+  let sessionId = preferredSessionId;
   try {
-    await flipPage(companyCode, labelCode, 2);
+    const flipped = await flipPage(companyCode, storeCode, labelCode, 2, sessionId);
+    sessionId = flipped.sessionId;
     pageFlipped = true;
     try {
-      await blinkLed(companyCode, labelCode);
+      await blinkLed(companyCode, storeCode, labelCode, sessionId);
     } catch (err) {
       console.error(`ESL: LED action failed for ${labelCode}:`, err.message);
     }
@@ -563,7 +450,7 @@ async function triggerEslActions(companyCode, labelCode, revertDelayMs = 60_000)
     throw err;
   } finally {
     if (pageFlipped) {
-      enqueueJob('revert', { companyCode, labelCode }, Date.now() + revertDelayMs);
+      enqueueJob('revert', { companyCode, storeCode, labelCode, sessionId }, Date.now() + revertDelayMs);
       console.log(`ESL: Durable revert scheduled for ${labelCode}`);
     }
   }
@@ -582,10 +469,24 @@ function validateAuth(req, res, next) {
     return res.status(503).json({ error: 'Relay authentication is not configured' });
   }
 
-  if (req.headers[headerName] !== expectedKey) {
+  const actual = Buffer.from(req.headers[headerName] || '');
+  const expected = Buffer.from(expectedKey);
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
+}
+
+async function requireSession(req, res, next) {
+  try {
+    const session = await database.findSession(req.get('x-session-token'));
+    if (!session) return res.status(401).json({ error: 'Associate session expired; please sign in again' });
+    req.associateSession = session;
+    next();
+  } catch (error) {
+    console.error('Session validation failed:', error.message);
+    res.status(503).json({ error: 'Session service is temporarily unavailable' });
+  }
 }
 
 const loginAttempts = new Map();
@@ -611,83 +512,98 @@ function limitLoginAttempts(req, res, next) {
 // ===========================================================================
 
 // Login: store credentials, verify them by getting a token immediately
-app.post('/auth/login', validateAuth, limitLoginAttempts, async (req, res) => {
+app.post('/auth/login', limitLoginAttempts, async (req, res) => {
   const { username, password } = req.body ?? {};
-  if (!username || !password) {
+  if (typeof username !== 'string' || typeof password !== 'string' ||
+      !username.trim() || !password || username.length > 256 || password.length > 1024) {
     return res.status(400).json({ error: 'username and password are required' });
   }
-
-  // With Railway-managed credentials, the app may still need to unlock a
-  // device after an intentional local timeout. Verify the submitted values
-  // against the managed credentials, but never replace the relay's global
-  // credential state with values supplied by a phone.
-  if (ENV_ESL_USERNAME && ENV_ESL_PASSWORD) {
-    if (username !== ENV_ESL_USERNAME || password !== ENV_ESL_PASSWORD) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    try {
-      await loginAndGetToken();
-      loginAttempts.delete(req.loginAttemptKey);
-      return res.json({ status: 'ok', message: `Logged in as ${ENV_ESL_USERNAME}` });
-    } catch (err) {
-      console.error('Auth: Managed login verification failed:', err.message);
-      return res.status(401).json({ error: err.message });
-    }
-  }
-
-  // Temporarily set credentials and attempt login
-  const previous = { ...credentials };
-  const previousTokens = { ...tokenCache };
-  credentials = { username, password };
-
   try {
-    // Clear any stale token so loginAndGetToken is forced
-    tokenCache = { accessToken: null, refreshToken: null, expiresAt: null };
-    await loginAndGetToken();
+    const tokens = await loginWithCredentials(username.trim(), password);
+    const session = await database.createSession(username.trim(), tokens);
     loginAttempts.delete(req.loginAttemptKey);
-    console.log(`Auth: Logged in as ${username}`);
-    res.json({ status: 'ok', message: `Logged in as ${username}` });
+    console.log(`Auth: associate logged in as ${username.trim()}`);
+    res.json({
+      status: 'ok',
+      username: username.trim(),
+      sessionToken: session.rawToken,
+      message: `Logged in as ${username.trim()}`,
+    });
   } catch (err) {
-    // A typo during re-authentication must not destroy a still-usable session.
-    credentials = previous;
-    tokenCache = previousTokens;
     console.error('Auth: Login failed:', err.message);
     res.status(401).json({ error: err.message });
   }
 });
 
-// Logout: wipe credentials and tokens
-app.post('/auth/logout', validateAuth, (req, res) => {
-  const who = credentials.username ?? 'unknown';
-  credentials = { username: ENV_ESL_USERNAME, password: ENV_ESL_PASSWORD };
-  tokenCache  = { accessToken: null, refreshToken: null, expiresAt: null };
-  clearPersistedSession();
-  console.log(`Auth: Session reset (was ${who}, managed=${!!ENV_ESL_USERNAME})`);
-  res.json({
-    status: 'ok',
-    message: ENV_ESL_USERNAME ? 'Session reset; managed login remains available' : 'Logged out',
-  });
-});
+app.post('/auth/logout', requireSession, asyncRoute(async (req, res) => {
+  await database.revokeSession(req.associateSession.id);
+  console.log(`Auth: associate logged out ${req.associateSession.username}`);
+  res.json({ status: 'ok', message: 'Logged out' });
+}));
 
-// Status: mobile app polls this to know if it needs to show login screen
-app.get('/auth/status', validateAuth, (req, res) => {
-  const tokenValid = !!(tokenCache.accessToken && tokenCache.expiresAt > new Date());
-  const managedRecoveryReady = !!(ENV_ESL_USERNAME && ENV_ESL_PASSWORD && !authHealth.lastError);
-  const loggedIn = tokenValid || managedRecoveryReady || !!tokenCache.refreshToken;
+app.get('/auth/status', asyncRoute(async (req, res) => {
+  const session = await database.findSession(req.get('x-session-token'));
+  if (!session) {
+    return res.json({ loggedIn: false, tokenValid: false, operational: false, managedLogin: false });
+  }
+  const tokenValid = !!(session.accessToken && session.accessExpiresAt > new Date());
   res.json({
-    loggedIn,
-    username:  loggedIn ? credentials.username : null,
+    loggedIn: true,
+    username: session.username,
     tokenValid,
-    operational: tokenValid || managedRecoveryReady,
-    managedLogin: !!(ENV_ESL_USERNAME && ENV_ESL_PASSWORD),
-    lastAuthSuccessAt: authHealth.lastSuccessAt,
-    lastAuthError: authHealth.lastError,
+    operational: tokenValid || !!session.refreshToken,
+    managedLogin: false,
   });
-});
+}));
+
+app.post('/devices/register', requireSession, asyncRoute(async (req, res) => {
+  const { fcmToken, companyCode, storeCode, storeName } = req.body ?? {};
+  if (typeof fcmToken !== 'string' || typeof companyCode !== 'string' ||
+      typeof storeCode !== 'string' || !fcmToken || !companyCode || !storeCode ||
+      fcmToken.length > 4096 || companyCode.length > 128 || storeCode.length > 128 ||
+      (storeName && (typeof storeName !== 'string' || storeName.length > 256))) {
+    return res.status(400).json({ error: 'fcmToken, companyCode and storeCode are required' });
+  }
+  await database.registerDevice(req.associateSession.id, fcmToken, companyCode, storeCode, storeName);
+  console.log(`Device registered: ${req.associateSession.username} -> ${companyCode}/${storeCode}`);
+  res.json({ status: 'ok' });
+}));
+
+app.post('/devices/unregister', requireSession, asyncRoute(async (req, res) => {
+  const { fcmToken } = req.body ?? {};
+  if (!fcmToken) return res.status(400).json({ error: 'fcmToken is required' });
+  await database.removeSessionDevice(req.associateSession.id, fcmToken);
+  res.json({ status: 'ok' });
+}));
 
 // ===========================================================================
 // Webhook Routes
 // ===========================================================================
+
+async function sendStoreMessage(companyCode, storeCode, message) {
+  const tokens = await database.getStoreDeviceTokens(companyCode, storeCode);
+  if (tokens.length === 0) {
+    console.warn(`FCM: no registered devices for ${companyCode}/${storeCode}`);
+    return { successCount: 0, failureCount: 0, deviceCount: 0 };
+  }
+  let successCount = 0;
+  let failureCount = 0;
+  for (let offset = 0; offset < tokens.length; offset += 500) {
+    const batch = tokens.slice(offset, offset + 500);
+    const result = await getMessaging().sendEachForMulticast({ ...message, tokens: batch });
+    successCount += result.successCount;
+    failureCount += result.failureCount;
+    await Promise.all(result.responses.map(async (response, index) => {
+      const code = response.error?.code || '';
+      if (code === 'messaging/registration-token-not-registered' ||
+          code === 'messaging/invalid-registration-token') {
+        await database.removeDeviceToken(batch[index]);
+      }
+    }));
+  }
+  console.log(`FCM: ${companyCode}/${storeCode} delivered=${successCount} failed=${failureCount}`);
+  return { successCount, failureCount, deviceCount: tokens.length };
+}
 
 async function processWebhookBody(rawBody) {
   try {
@@ -765,27 +681,41 @@ async function processWebhookBody(rawBody) {
       ? `Help needed for ${name} - AISLE ${aisle}`
       : `Help needed for ${name}`;
 
-    // New button press — clear any stale acknowledgement so it can be acknowledged fresh
-    if (labelCode) {
-      acknowledgements.delete(acknowledgementKey(companyCode, storeCode, labelCode));
-      saveAcknowledgements();
+    const created = await database.createCall({
+      companyCode,
+      storeCode,
+      labelCode,
+      articleId,
+      articleName: name,
+      aisle: aisle || null,
+      message: alertMessage,
+      payload: body,
+    });
+    if (!created.created) {
+      console.log(`Webhook: duplicate open call ignored for ${companyCode}/${storeCode}/${labelCode}`);
+      return;
     }
 
-    const topic = fcmSafeTopic(['employee-calls', companyCode, storeCode]);
-
-    const fcmResult = await getMessaging().send({
-      topic,
+    const callId = created.call.id;
+    const fcmResult = await sendStoreMessage(companyCode, storeCode, {
       data: {
         title:       'Employee Call',
         message:     alertMessage,
-        companyCode,           // passed back to app so it can call /esl/acknowledge
+        callId,
+        companyCode,
         storeCode,
         labelCode,
         payload:     JSON.stringify(body),
       },
       android: { priority: 'high', ttl: 60000 },
     });
-    console.log(`FCM sent (topic=${topic}):`, fcmResult);
+    console.log(`FCM call ${callId}:`, fcmResult);
+
+    await database.addCallEvent({
+      callId,
+      eventType: 'delivered',
+      details: fcmResult,
+    });
 
     appendCallEvent({
       type:         'delivered',
@@ -808,30 +738,37 @@ function handleWebhook(req, res) {
   res.status(202).json({ status: 'accepted', jobId: job.id });
 }
 
-app.post('/',        validateAuth, handleWebhook);
 app.post('/webhook', validateAuth, handleWebhook);
 
 // "On My Way" — triggered by the mobile app when user acknowledges the call
-app.post('/esl/acknowledge', validateAuth, async (req, res) => {
-  const { companyCode, storeCode, labelCode } = req.body ?? {};
+app.post('/esl/acknowledge', requireSession, asyncRoute(async (req, res) => {
+  const { callId, companyCode, storeCode, labelCode } = req.body ?? {};
   if (!companyCode || !storeCode || !labelCode) {
     return res.status(400).json({ error: 'companyCode, storeCode and labelCode are required' });
   }
+  if (callId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(callId)) {
+    return res.status(400).json({ error: 'callId is invalid' });
+  }
+  if (req.associateSession.companyCode !== companyCode || req.associateSession.storeCode !== storeCode) {
+    return res.status(403).json({ error: 'This associate is not registered to that store' });
+  }
 
-  // Check if already acknowledged within the TTL window
-  const ackKey = acknowledgementKey(companyCode, storeCode, labelCode);
-  const existing = acknowledgements.get(ackKey);
-  if (existing && (Date.now() - existing.timestamp) < ACKNOWLEDGE_TTL_MS) {
-    console.log(`ESL: ${labelCode} already acknowledged — ignoring duplicate`);
+  const claimResult = await database.claimCall({
+    callId: callId || null,
+    companyCode,
+    storeCode,
+    labelCode,
+    session: req.associateSession,
+  });
+  if (!claimResult.claimed) {
     return res.status(409).json({
       status: 'already_acknowledged',
-      message: 'Already acknowledged by another device',
+      message: claimResult.call?.claimed_by_username
+        ? `Already acknowledged by ${claimResult.call.claimed_by_username}`
+        : 'Already acknowledged by another associate',
     });
   }
 
-  // Mark as acknowledged
-  acknowledgements.set(ackKey, { timestamp: Date.now() });
-  saveAcknowledgements();
   console.log(`ESL: Acknowledge from app — ${companyCode} / ${storeCode} / ${labelCode}`);
 
   appendCallEvent({
@@ -847,23 +784,32 @@ app.post('/esl/acknowledge', validateAuth, async (req, res) => {
   const mapping  = getFieldMapping(companyCode, storeCode);
   const rawDelay = Number(mapping.revertDelaySeconds) || 60;
   const delaySec = Math.max(5, Math.min(600, rawDelay));
-  enqueueJob('cancel', { companyCode, storeCode, labelCode });
+  enqueueJob('cancel', { callId: claimResult.call.id, companyCode, storeCode, labelCode });
   enqueueJob('esl-actions', {
-    companyCode, labelCode, revertDelayMs: delaySec * 1000,
+    companyCode, storeCode, labelCode,
+    sessionId: req.associateSession.id,
+    revertDelayMs: delaySec * 1000,
   });
-  res.json({ status: 'ok' });
-});
+  res.json({
+    status: 'ok',
+    callId: claimResult.call.id,
+    claimedBy: req.associateSession.username,
+  });
+}));
 
 // Reports a terminal status for an alert that the relay never observed —
 // missed (timed out on the device) or dismissed (manually closed). Fire-and-
 // forget from the app; failures are logged but never block the user.
-app.post('/esl/status', validateAuth, (req, res) => {
-  const { companyCode, storeCode, labelCode, status } = req.body ?? {};
+app.post('/esl/status', requireSession, asyncRoute(async (req, res) => {
+  const { callId, companyCode, storeCode, labelCode, status } = req.body ?? {};
   const allowed = new Set(['missed', 'dismissed']);
   if (!companyCode || !storeCode || !labelCode || !allowed.has(status)) {
     return res.status(400).json({
       error: 'companyCode, storeCode, labelCode and status (missed|dismissed) are required',
     });
+  }
+  if (req.associateSession.companyCode !== companyCode || req.associateSession.storeCode !== storeCode) {
+    return res.status(403).json({ error: 'This associate is not registered to that store' });
   }
   appendCallEvent({
     type:      status,           // 'missed' or 'dismissed'
@@ -872,20 +818,26 @@ app.post('/esl/status', validateAuth, (req, res) => {
     store:     storeCode,
     labelCode,
   });
+  await database.addCallEvent({
+    callId: callId || null,
+    eventType: status,
+    session: req.associateSession,
+    details: { companyCode, storeCode, labelCode },
+  });
   res.json({ status: 'ok' });
-});
+}));
 
 // ===========================================================================
 // Admin Routes — used by the mobile app's setup screens
 // ===========================================================================
 
 // List stores for a company. Proxies Solum so the app doesn't need its own token.
-app.get('/admin/stores', validateAuth, async (req, res) => {
+app.get('/admin/stores', requireSession, async (req, res) => {
   const company = (req.query.company ?? '').toString().trim();
   if (!company) return res.status(400).json({ error: 'company is required' });
 
   try {
-    const token = await getAccessToken(company);
+    const token = await getSessionAccessToken(req.associateSession.id, company);
     const resp  = await fetchWithTimeout(`${ESL_BASE_URL}/api/v2/common/store?company=${encodeURIComponent(company)}`, {
       method: 'GET',
       headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
@@ -899,12 +851,12 @@ app.get('/admin/stores', validateAuth, async (req, res) => {
 });
 
 // Fetch the article column schema so the admin screen can populate dropdowns.
-app.get('/admin/articles/upload/format', validateAuth, async (req, res) => {
+app.get('/admin/articles/upload/format', requireSession, async (req, res) => {
   const company = (req.query.company ?? '').toString().trim();
   if (!company) return res.status(400).json({ error: 'company is required' });
 
   try {
-    const token = await getAccessToken(company);
+    const token = await getSessionAccessToken(req.associateSession.id, company);
     const resp  = await fetchWithTimeout(`${ESL_BASE_URL}/api/v2/common/articles/upload/format?company=${encodeURIComponent(company)}`, {
       method: 'GET',
       headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
@@ -919,7 +871,7 @@ app.get('/admin/articles/upload/format', validateAuth, async (req, res) => {
 
 // Read the saved field mapping for one company/store. Returns DEFAULT_MAPPING
 // when nothing is saved yet, so the admin screen always has something to show.
-app.get('/admin/field-mapping', validateAuth, (req, res) => {
+app.get('/admin/field-mapping', requireSession, (req, res) => {
   const company = (req.query.company ?? '').toString().trim();
   const store   = (req.query.store   ?? '').toString().trim();
   if (!company || !store) {
@@ -930,7 +882,7 @@ app.get('/admin/field-mapping', validateAuth, (req, res) => {
   res.json({ mapping, saved });
 });
 
-app.post('/admin/field-mapping', validateAuth, (req, res) => {
+app.post('/admin/field-mapping', requireSession, (req, res) => {
   const { company, store, mapping } = req.body ?? {};
   if (!company || !store || !mapping) {
     return res.status(400).json({ error: 'company, store and mapping are required' });
@@ -960,7 +912,7 @@ app.post('/admin/field-mapping', validateAuth, (req, res) => {
 // screen renders. Status updates are matched back to the most recent prior
 // delivered event for the same (company, store, labelCode) — that's how a
 // "missed"/"acknowledged" event picks up the article name + aisle.
-app.get('/admin/analytics', validateAuth, (req, res) => {
+app.get('/admin/analytics', requireSession, (req, res) => {
   const company = (req.query.company ?? '').toString().trim();
   const store   = (req.query.store   ?? '').toString().trim();
   const range   = (req.query.range   ?? '7d').toString();
@@ -1064,16 +1016,33 @@ function perHour(calls) {
   return buckets;
 }
 
-app.get('/health', (_req, res) => {
-  const tokenValid = !!(tokenCache.accessToken && tokenCache.expiresAt > new Date());
-  const authOperational = tokenValid || !!(ENV_ESL_USERNAME && ENV_ESL_PASSWORD && !authHealth.lastError);
-  res.json({
-    status: authOperational ? 'running' : 'degraded',
-    timestamp: new Date().toISOString(),
-    authOperational,
-    pendingJobs: jobs.size,
-    lastAuthSuccessAt: authHealth.lastSuccessAt,
-  });
+app.get('/health', async (_req, res) => {
+  try {
+    const db = await database.health();
+    res.json({
+      status: 'running',
+      timestamp: new Date().toISOString(),
+      database: db,
+      pendingJobs: jobs.size,
+    });
+  } catch (error) {
+    res.status(503).json({
+      status: 'degraded',
+      timestamp: new Date().toISOString(),
+      database: { connected: false, error: error.message },
+      pendingJobs: jobs.size,
+    });
+  }
+});
+
+mountOps(app, database, () => ({ pendingJobs: jobs.size }));
+
+app.use((error, _req, res, _next) => {
+  if (error instanceof SyntaxError && error.status === 400) {
+    return res.status(400).json({ error: 'Invalid JSON request body' });
+  }
+  console.error('Unhandled request error:', error.message);
+  if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
 });
 
 // ===========================================================================
@@ -1081,31 +1050,25 @@ app.get('/health', (_req, res) => {
 // ===========================================================================
 const PORT = process.env.PORT || 3000;
 
-function startRelay() {
+async function startRelay() {
   if (!process.env.AUTH_KEY) {
     throw new Error('AUTH_KEY is required; refusing to start without request authentication');
   }
+  await database.initDatabase();
+  await database.ensureOpsAdmin(process.env.OPS_USERNAME, process.env.OPS_PASSWORD);
+  await database.pruneOperationsData();
+  connectLogPersistence(database);
   loadMappings();
-  loadPersistedSession();
-  loadAcknowledgements();
   loadJobs();
-
-  if (ENV_ESL_USERNAME && ENV_ESL_PASSWORD &&
-      !(tokenCache.accessToken && tokenCache.expiresAt > new Date())) {
-    authHealth.lastError = 'Authentication validation in progress';
-    loginAndGetToken().catch(err => {
-      authHealth.lastError = err.message;
-      console.error('ESL Auth: startup validation failed:', err.message);
-    });
-  }
-
   scheduleJobRunner();
   app.listen(PORT, () => console.log(`ESL Relay listening on port ${PORT}`));
 }
 
-try {
-  startRelay();
-} catch (err) {
+(async () => {
+  try {
+    await startRelay();
+  } catch (err) {
   console.error('Relay startup failed:', err.message);
   process.exitCode = 1;
-}
+  }
+})();

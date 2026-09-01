@@ -1,0 +1,50 @@
+limit_req_zone $binary_remote_addr zone=esl_api:10m rate=20r/s;
+limit_req_zone $binary_remote_addr zone=esl_webhook:10m rate=5r/s;
+
+server {
+    listen 8443 ssl;
+    server_name 20.121.68.137;
+
+    ssl_certificate /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:ESLSSL:10m;
+    ssl_session_timeout 1d;
+    server_tokens off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'" always;
+
+    client_max_body_size 128k;
+
+    location = /webhook {
+        allow 135.237.10.33;
+        allow 51.8.21.131;
+        deny all;
+        limit_req zone=esl_webhook burst=20 nodelay;
+        if ($request_method != POST) { return 405; }
+
+        proxy_pass http://relay:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 35s;
+    }
+
+    location / {
+        limit_req zone=esl_api burst=40 nodelay;
+        proxy_pass http://relay:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 35s;
+    }
+}

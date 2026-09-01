@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign in · Employee Call Operation</title>
+  <link rel="stylesheet" href="/ops/login.css">
+</head>
+<body>
+  <main>
+    <section class="brand">
+      <p class="eyebrow">SOLUM INTERNAL</p>
+      <h1>Employee Call Operation</h1>
+      <p>Monitor relay health, associate devices, calls, and seven days of diagnostic logs.</p>
+    </section>
+    <section class="card">
+      <h2>Administrator sign in</h2>
+      <p id="error" class="error" hidden>Username or password is incorrect.</p>
+      <form method="post" action="/ops/login">
+        <label>Username<input name="username" autocomplete="username" required autofocus></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+      </form>
+      <p class="access">Authorized administrators only</p>
+    </section>
+  </main>
+  <script src="/ops/login.js" defer></script>
+</body>
+</html>

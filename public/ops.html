@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Employee Call Operation</title>
+  <link rel="stylesheet" href="/ops/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">SOLUM INTERNAL</p>
+      <h1>Employee Call Operation</h1>
+      <p id="updated">Connecting…</p>
+    </div>
+    <div class="header-actions">
+      <button id="refresh" type="button">Refresh now</button>
+      <form method="post" action="/ops/logout"><button type="submit">Sign out</button></form>
+    </div>
+  </header>
+  <main>
+    <section id="notice" class="notice" hidden></section>
+    <section class="metrics" aria-label="Relay metrics">
+      <article><span>Service</span><strong id="serviceStatus">—</strong></article>
+      <article><span>Database</span><strong id="databaseStatus">—</strong></article>
+      <article><span>Associates</span><strong id="sessions">—</strong></article>
+      <article><span>Devices</span><strong id="devices">—</strong></article>
+      <article><span>Open calls</span><strong id="openCalls">—</strong></article>
+      <article><span>Calls · 24h</span><strong id="calls24h">—</strong></article>
+      <article><span>Queued jobs</span><strong id="pendingJobs">—</strong></article>
+      <article><span>Uptime</span><strong id="uptime">—</strong></article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading"><h2>Recent calls</h2><span>Newest first</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>Store</th><th>Label</th><th>Message</th><th>Status</th><th>Claimed by</th></tr></thead>
+          <tbody id="calls"><tr><td colspan="6">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div><h2>Application logs</h2><span>Retained for the last 7 days</span></div>
+        <select id="logLevel" aria-label="Log level">
+          <option value="">All levels</option><option value="error">Errors</option>
+          <option value="warn">Warnings</option><option value="log">Information</option>
+        </select>
+      </div>
+      <ol id="logs" class="logs"><li>Loading…</li></ol>
+    </section>
+  </main>
+  <script src="/ops/app.js" defer></script>
+</body>
+</html>
