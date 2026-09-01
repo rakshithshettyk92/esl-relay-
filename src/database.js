@@ -363,8 +363,13 @@ function hashPassword(password, salt) {
 async function ensureOpsAdmin(username, password) {
   if (!username || !password) throw new Error('OPS_USERNAME and OPS_PASSWORD are required');
   const existing = await pool.query('SELECT id FROM ops_users WHERE username=$1', [username]);
-  if (existing.rows[0]) return;
   const salt = crypto.randomBytes(24).toString('base64');
+  if (existing.rows[0]) {
+    await pool.query(`
+      UPDATE ops_users SET password_salt=$2, password_hash=$3 WHERE id=$1
+    `, [existing.rows[0].id, salt, hashPassword(password, salt)]);
+    return;
+  }
   await pool.query(`
     INSERT INTO ops_users (id, username, password_salt, password_hash)
     VALUES ($1,$2,$3,$4) ON CONFLICT (username) DO NOTHING
