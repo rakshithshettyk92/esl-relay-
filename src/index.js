@@ -612,14 +612,27 @@ function limitLoginAttempts(req, res, next) {
 
 // Login: store credentials, verify them by getting a token immediately
 app.post('/auth/login', validateAuth, limitLoginAttempts, async (req, res) => {
-  if (ENV_ESL_USERNAME && ENV_ESL_PASSWORD) {
-    return res.status(409).json({
-      error: 'Relay login is managed by server configuration; update ESL_USERNAME/ESL_PASSWORD',
-    });
-  }
   const { username, password } = req.body ?? {};
   if (!username || !password) {
     return res.status(400).json({ error: 'username and password are required' });
+  }
+
+  // With Railway-managed credentials, the app may still need to unlock a
+  // device after an intentional local timeout. Verify the submitted values
+  // against the managed credentials, but never replace the relay's global
+  // credential state with values supplied by a phone.
+  if (ENV_ESL_USERNAME && ENV_ESL_PASSWORD) {
+    if (username !== ENV_ESL_USERNAME || password !== ENV_ESL_PASSWORD) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    try {
+      await loginAndGetToken();
+      loginAttempts.delete(req.loginAttemptKey);
+      return res.json({ status: 'ok', message: `Logged in as ${ENV_ESL_USERNAME}` });
+    } catch (err) {
+      console.error('Auth: Managed login verification failed:', err.message);
+      return res.status(401).json({ error: err.message });
+    }
   }
 
   // Temporarily set credentials and attempt login

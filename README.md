@@ -27,6 +27,9 @@ For reliable unattended operation, set `ESL_USERNAME` and `ESL_PASSWORD` as
 Railway variables. This lets the relay obtain a fresh Solum token after a
 restart or after the persisted refresh token expires. The password is retained
 only in the Railway environment and is never written to the relay data files.
+If a phone has an intentional local session timeout, entering those same AIMS
+credentials verifies and unlocks that phone without replacing the relay's
+managed credential state or signing out other devices.
 
 Mount a Railway Volume at `/app/data` and set `DATA_DIR=/app/data`. The relay
 stores refresh tokens, per-store field mappings, and analytics there; without a
