@@ -31,4 +31,37 @@ function articleCacheKey(companyCode, storeCode, articleId, mapping = {}) {
   ]);
 }
 
-module.exports = { boundedInt, fcmSafeTopic, usableTokenLifetimeMs, articleCacheKey };
+function validTimeZone(value) {
+  if (!value || value.length > 64 || !/^[A-Za-z0-9_+\-/]+$/.test(value)) return 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
+    return value;
+  } catch {
+    return 'UTC';
+  }
+}
+
+function perHour(calls, timeZone) {
+  const buckets = new Array(24).fill(0);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: validTimeZone(timeZone),
+    hour: 'numeric',
+    hourCycle: 'h23',
+  });
+  for (const call of calls) {
+    const hourPart = formatter.formatToParts(new Date(call.deliveredAt))
+      .find(part => part.type === 'hour');
+    const hour = Number(hourPart?.value) % 24;
+    if (Number.isInteger(hour)) buckets[hour] += 1;
+  }
+  return buckets;
+}
+
+module.exports = {
+  boundedInt,
+  fcmSafeTopic,
+  usableTokenLifetimeMs,
+  articleCacheKey,
+  validTimeZone,
+  perHour,
+};

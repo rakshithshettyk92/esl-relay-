@@ -7,6 +7,8 @@ const {
   fcmSafeTopic,
   usableTokenLifetimeMs,
   articleCacheKey,
+  validTimeZone,
+  perHour,
 } = require('../src/runtime-utils');
 
 test('boundedInt applies defaults and clamps unsafe values', () => {
@@ -43,4 +45,16 @@ test('article cache keys change when the requested mapping fields change', () =>
     articleNameField: 'ITEM_NAME',
     helpEnabledField: 'ASSOCIATE_HELP_ENABLED',
   }));
+});
+
+test('invalid timezones fall back to UTC', () => {
+  assert.equal(validTimeZone('America/New_York'), 'America/New_York');
+  assert.equal(validTimeZone('../../invalid'), 'UTC');
+  assert.equal(validTimeZone('Not/A_Timezone'), 'UTC');
+});
+
+test('hour buckets use the requesting device timezone', () => {
+  const calls = [{ deliveredAt: Date.parse('2026-09-01T01:30:00Z') }];
+  assert.equal(perHour(calls, 'America/New_York')[21], 1);
+  assert.equal(perHour(calls, 'Asia/Kolkata')[7], 1);
 });

@@ -5,7 +5,13 @@ const crypto = require('crypto');
 const express = require('express');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getMessaging } = require('firebase-admin/messaging');
-const { boundedInt, usableTokenLifetimeMs, articleCacheKey } = require('./runtime-utils');
+const {
+  boundedInt,
+  usableTokenLifetimeMs,
+  articleCacheKey,
+  validTimeZone,
+  perHour,
+} = require('./runtime-utils');
 const database = require('./database');
 const { installLogCapture, connectLogPersistence, mountOps } = require('./ops');
 
@@ -194,6 +200,7 @@ async function runDueJobs() {
             type: 'cancel',
             callId: job.payload.callId || '',
             labelCode: job.payload.labelCode,
+            claimedBy: job.payload.claimedBy || '',
           },
           android: { priority: 'high', ttl: 30000 },
         });
@@ -623,7 +630,7 @@ async function processWebhookBody(rawBody) {
     // Only "buttonPress" represents an actual customer action; everything
     // else is noise that previously fired duplicate alerts.
     if (body.type && body.type !== 'buttonPress') {
-      console.log(`Webhook: type=${body.type} — not a button press, skipping`);
+      console.log(`Event ignored: type=${body.type}. Only buttonPress creates an employee call.`);
       return;
     }
 
@@ -635,14 +642,14 @@ async function processWebhookBody(rawBody) {
     const articleId   = articleIds[0] ?? '';
 
     if (!companyCode || !storeCode) {
-      console.warn('Webhook missing customerCode/storeCode — cannot route, dropping.');
+      console.warn('Call skipped: webhook is missing customerCode or storeCode and cannot be routed.');
       return;
     }
 
     // Filter 0: Solum uses the sentinel articleId "imagepush" for image-push
     // events on a label. Drop without hitting Solum — saves an API call.
     if (articleId.toLowerCase() === 'imagepush') {
-      console.log(`Webhook: ${articleId} sentinel — image-push event, skipping`);
+      console.log(`Event ignored: ${articleId} is an image-push event, not an employee call.`);
       return;
     }
 
@@ -666,12 +673,18 @@ async function processWebhookBody(rawBody) {
     // Missing field or mismatched value both count as "help not enabled" → drop.
     const flag = (article[mapping.helpEnabledField] ?? '').toString().trim();
     if (flag === '' || flag.toUpperCase() !== mapping.helpEnabledValue.toUpperCase()) {
-      const reason = flag === '' ? 'help_field_missing' : 'help_disabled';
-      console.log(
-        `Webhook: ${articleId} ${reason} ` +
-        `article["${mapping.helpEnabledField}"]=${JSON.stringify(flag)} ` +
-        `configured=${JSON.stringify(mapping.helpEnabledValue)}, skipping`
-      );
+      if (flag === '') {
+        console.log(
+          `Call skipped: article ${articleId} has no value in eligibility field ` +
+          `"${mapping.helpEnabledField}". Expected "${mapping.helpEnabledValue}". ` +
+          'Update the AIMS article or the store Call Rules.'
+        );
+      } else {
+        console.log(
+          `Call skipped: article ${articleId} has "${flag}" in eligibility field ` +
+          `"${mapping.helpEnabledField}"; expected "${mapping.helpEnabledValue}".`
+        );
+      }
       return;
     }
 
@@ -764,15 +777,17 @@ app.post('/esl/acknowledge', requireSession, asyncRoute(async (req, res) => {
     session: req.associateSession,
   });
   if (!claimResult.claimed) {
+    const claimedBy = claimResult.call?.claimed_by_username || '';
     return res.status(409).json({
       status: 'already_acknowledged',
-      message: claimResult.call?.claimed_by_username
-        ? `Already acknowledged by ${claimResult.call.claimed_by_username}`
+      claimedBy,
+      message: claimedBy
+        ? `Already acknowledged by ${claimedBy}`
         : 'Already acknowledged by another associate',
     });
   }
 
-  console.log(`ESL: Acknowledge from app — ${companyCode} / ${storeCode} / ${labelCode}`);
+  console.log(`ESL: Acknowledge from app: ${companyCode} / ${storeCode} / ${labelCode}`);
 
   appendCallEvent({
     type:      'acknowledged',
@@ -787,7 +802,13 @@ app.post('/esl/acknowledge', requireSession, asyncRoute(async (req, res) => {
   const mapping  = getFieldMapping(companyCode, storeCode);
   const rawDelay = Number(mapping.revertDelaySeconds) || 60;
   const delaySec = Math.max(5, Math.min(600, rawDelay));
-  enqueueJob('cancel', { callId: claimResult.call.id, companyCode, storeCode, labelCode });
+  enqueueJob('cancel', {
+    callId: claimResult.call.id,
+    companyCode,
+    storeCode,
+    labelCode,
+    claimedBy: req.associateSession.username,
+  });
   enqueueJob('esl-actions', {
     companyCode, storeCode, labelCode,
     sessionId: req.associateSession.id,
@@ -922,11 +943,13 @@ app.get('/admin/analytics', requireSession, (req, res) => {
   const company = (req.query.company ?? '').toString().trim();
   const store   = (req.query.store   ?? '').toString().trim();
   const range   = (req.query.range   ?? '7d').toString();
+  const timeZone = validTimeZone((req.query.timeZone ?? '').toString());
+  const todayStartMs = Number(req.query.todayStartMs);
   if (!company || !store) {
     return res.status(400).json({ error: 'company and store are required' });
   }
 
-  const sinceTs = rangeStartMs(range);
+  const sinceTs = rangeStartMs(range, todayStartMs);
   const events = readCallEvents(sinceTs).filter(
     e => e.company === company && e.store === store
   );
@@ -981,18 +1004,24 @@ app.get('/admin/analytics', requireSession, (req, res) => {
     company,
     store,
     range,
+    timeZone,
     sinceTs,
     totals,
     responseMs:  { avg: avgMs, p50: p50Ms, p95: p95Ms, samples: responseMs.length },
     topAisles:   topByKey(calls, c => c.aisle, 10),
     topArticles: topByKey(calls, c => c.articleName, 10),
-    perHour:     perHour(calls),
+    perHour:     perHour(calls, timeZone),
   });
 });
 
-function rangeStartMs(range) {
+function rangeStartMs(range, deviceTodayStartMs) {
   const now = Date.now();
   if (range === 'today') {
+    if (Number.isFinite(deviceTodayStartMs)
+        && deviceTodayStartMs >= now - 36 * 60 * 60 * 1000
+        && deviceTodayStartMs <= now + 60 * 60 * 1000) {
+      return deviceTodayStartMs;
+    }
     const d = new Date(); d.setHours(0, 0, 0, 0);
     return d.getTime();
   }
@@ -1011,15 +1040,6 @@ function topByKey(calls, keyFn, limit) {
     .map(([key, count]) => ({ key, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, limit);
-}
-
-function perHour(calls) {
-  const buckets = new Array(24).fill(0);
-  for (const c of calls) {
-    const h = new Date(c.deliveredAt).getHours();
-    buckets[h] += 1;
-  }
-  return buckets;
 }
 
 app.get('/health', async (_req, res) => {

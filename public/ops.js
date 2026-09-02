@@ -35,7 +35,7 @@ async function loadStatus() {
       <td>${escapeHtml(`${call.company_code} / ${call.store_code}`)}</td>
       <td>${escapeHtml(call.label_code)}</td><td>${escapeHtml(call.message)}</td>
       <td><span class="status">${escapeHtml(call.status)}</span></td>
-      <td>${escapeHtml(call.claimed_by_username || '—')}</td></tr>`).join('')
+      <td>${escapeHtml(call.claimed_by_username || 'Not yet attended')}</td></tr>`).join('')
       : '<tr><td colspan="6">No calls recorded yet.</td></tr>';
   } catch (error) {
     notice.hidden = false;
