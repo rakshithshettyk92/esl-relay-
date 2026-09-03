@@ -12,6 +12,16 @@ function duration(seconds) {
   return `${days ? `${days}d ` : ''}${hours}h ${minutes}m`;
 }
 
+function missedReason(reason) {
+  return ({
+    no_associates_signed_in: 'No associates were signed in',
+    no_registered_devices: 'No registered devices were available',
+    notification_delivery_failed: 'The alert could not be delivered',
+    processing_failed: 'The call could not be prepared',
+    no_response: 'No associate responded in time',
+  })[reason] || '';
+}
+
 async function loadStatus() {
   const notice = byId('notice');
   try {
@@ -34,7 +44,9 @@ async function loadStatus() {
       <tr><td>${escapeHtml(new Date(call.created_at).toLocaleString())}</td>
       <td>${escapeHtml(`${call.company_code} / ${call.store_code}`)}</td>
       <td>${escapeHtml(call.label_code)}</td><td>${escapeHtml(call.message)}</td>
-      <td><span class="status">${escapeHtml(call.status)}</span></td>
+      <td><span class="status">${escapeHtml(call.status)}</span>${call.resolution_reason
+        ? `<small class="call-reason">${escapeHtml(missedReason(call.resolution_reason))}</small>`
+        : ''}</td>
       <td>${escapeHtml(call.claimed_by_username || 'Not yet attended')}</td></tr>`).join('')
       : '<tr><td colspan="6">No calls recorded yet.</td></tr>';
   } catch (error) {

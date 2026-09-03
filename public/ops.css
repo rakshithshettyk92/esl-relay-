@@ -21,6 +21,7 @@ main { width:min(1500px,100%); margin:auto; padding:28px clamp(16px,4vw,52px) 60
 .table-wrap { overflow:auto; } table { width:100%; border-collapse:collapse; min-width:780px; }
 th,td { text-align:left; padding:12px 16px; border-bottom:1px solid #f0eaf3; font-size:14px; } th { color:#695773; background:#faf8fb; }
 .status { display:inline-block; padding:4px 8px; border-radius:999px; background:#eee7f1; font-weight:700; }
+.call-reason { display:block; margin-top:6px; max-width:210px; color:#74657d; line-height:1.35; }
 .logs { margin:0; padding:0; list-style:none; max-height:520px; overflow:auto; background:#1f1724; color:#eee7f1; }
 .logs li { display:grid; grid-template-columns:170px 64px 1fr; gap:10px; padding:9px 14px; border-bottom:1px solid #372c3d; font:12px/1.5 ui-monospace,Consolas,monospace; }
 .logs .error { color:#ff9e9e; }.logs .warn { color:#ffdc8a; }.logs time { color:#a99cb0; }

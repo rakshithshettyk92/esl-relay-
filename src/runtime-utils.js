@@ -57,6 +57,19 @@ function perHour(calls, timeZone) {
   return buckets;
 }
 
+function jobRetryDecision(job, policy, now = Date.now()) {
+  const attempts = Math.max(0, Number(job?.attempts) || 0);
+  const createdAt = Number(job?.createdAt) || Number(job?.runAt) || now;
+  const ageMs = Math.max(0, now - createdAt);
+  const maxAttempts = Math.max(1, Number(policy?.maxAttempts) || 1);
+  const maxAgeMs = Math.max(1, Number(policy?.maxAgeMs) || 1);
+  const exhausted = attempts >= maxAttempts || ageMs >= maxAgeMs;
+  const baseDelayMs = Math.max(1, Number(policy?.baseDelayMs) || 5_000);
+  const maxDelayMs = Math.max(baseDelayMs, Number(policy?.maxDelayMs) || 5 * 60_000);
+  const delayMs = Math.min(maxDelayMs, baseDelayMs * (2 ** Math.min(attempts, 6)));
+  return { retry: !exhausted, attempts, ageMs, delayMs };
+}
+
 module.exports = {
   boundedInt,
   fcmSafeTopic,
@@ -64,4 +77,5 @@ module.exports = {
   articleCacheKey,
   validTimeZone,
   perHour,
+  jobRetryDecision,
 };

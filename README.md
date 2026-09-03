@@ -60,6 +60,18 @@ store selection it registers its exact FCM token with the relay. Calls are sent
 only to devices registered to that company/store, and PostgreSQL atomically
 ensures that only the first associate can claim a call.
 
+If no associate is signed in when a button is pressed, the relay records the
+call once as missed with that reason. It does not retry indefinitely. Calls
+that are delivered but not accepted within the configured response window are
+also closed as missed. The app's History screen reads the store's terminal
+call records for the latest seven days, so associates who sign in later can
+see what happened while no device was available.
+
+Multiple associates can be signed in to the same store. The relay tries their
+sessions in recent-use order until one usable AIMS token is found, fetches the
+article once, and broadcasts the alert to every registered store device. The
+first database claim wins and all other devices are told who attended it.
+
 ## Local development
 
 Copy `.env.example` to `.env`, provide a local PostgreSQL `DATABASE_URL`, and

@@ -11,6 +11,7 @@ const {
   articleCacheKey,
   validTimeZone,
   perHour,
+  jobRetryDecision,
 } = require('./runtime-utils');
 const database = require('./database');
 const { installLogCapture, connectLogPersistence, mountOps } = require('./ops');
@@ -33,6 +34,10 @@ function envInt(name, fallback, min, max) {
   return boundedInt(process.env[name], fallback, min, max);
 }
 
+function envIntValue(value, fallback, min, max) {
+  return boundedInt(value, fallback, min, max);
+}
+
 // ===========================================================================
 // Runtime configuration and bounded in-memory caches.
 // Associate sessions and encrypted AIMS tokens live in PostgreSQL.
@@ -44,6 +49,9 @@ const ESL_REQUEST_TIMEOUT_MS = envInt('ESL_REQUEST_TIMEOUT_MS', 20_000, 1_000, 1
 const TOKEN_REFRESH_BUFFER_SECONDS = envInt('TOKEN_REFRESH_BUFFER_SECONDS', 300, 0, 3_600);
 const ARTICLE_LOOKUP_TIMEOUT_MS = envInt('ARTICLE_LOOKUP_TIMEOUT_MS', 30_000, 5_000, 120_000);
 const ARTICLE_CACHE_TTL_MS = envInt('ARTICLE_CACHE_TTL_SECONDS', 300, 0, 3_600) * 1000;
+const CALL_RESPONSE_TIMEOUT_MS = envInt('CALL_RESPONSE_TIMEOUT_SECONDS', 60, 15, 600) * 1000;
+const WEBHOOK_MAX_ATTEMPTS = envInt('WEBHOOK_MAX_ATTEMPTS', 3, 1, 10);
+const BACKGROUND_JOB_MAX_ATTEMPTS = envInt('BACKGROUND_JOB_MAX_ATTEMPTS', 8, 1, 20);
 const articleCache = new Map();
 const sessionTokenPromises = new Map();
 
@@ -154,7 +162,10 @@ function loadJobs() {
     if (!fs.existsSync(JOBS_FILE)) return;
     const stored = JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8'));
     for (const job of Array.isArray(stored) ? stored : []) {
-      if (job?.id && job?.type && Number.isFinite(job.runAt)) jobs.set(job.id, job);
+      if (job?.id && job?.type && Number.isFinite(job.runAt)) {
+        job.createdAt = Number(job.createdAt) || Number.parseInt(job.id, 10) || job.runAt;
+        jobs.set(job.id, job);
+      }
     }
     console.log(`Jobs: restored ${jobs.size} pending job(s)`);
   } catch (err) {
@@ -168,12 +179,30 @@ function enqueueJob(type, payload, runAt = Date.now()) {
     type,
     payload,
     runAt,
+    createdAt: Date.now(),
     attempts: 0,
   };
   jobs.set(job.id, job);
   saveJobs();
   scheduleJobRunner();
   return job;
+}
+
+function retryPolicyFor(job) {
+  if (job.type === 'webhook') {
+    return {
+      maxAttempts: WEBHOOK_MAX_ATTEMPTS,
+      maxAgeMs: CALL_RESPONSE_TIMEOUT_MS,
+      baseDelayMs: 5_000,
+      maxDelayMs: 30_000,
+    };
+  }
+  return {
+    maxAttempts: BACKGROUND_JOB_MAX_ATTEMPTS,
+    maxAgeMs: 60 * 60_000,
+    baseDelayMs: 5_000,
+    maxDelayMs: 5 * 60_000,
+  };
 }
 
 function scheduleJobRunner() {
@@ -207,13 +236,32 @@ async function runDueJobs() {
       } else if (job.type === 'esl-actions') {
         await triggerEslActions(job.payload.companyCode, job.payload.storeCode,
           job.payload.labelCode, job.payload.revertDelayMs, job.payload.sessionId);
+      } else if (job.type === 'expire-call') {
+        await finalizeMissedCall(job.payload, 'no_response');
       }
       jobs.delete(job.id);
     } catch (err) {
       job.attempts = (job.attempts || 0) + 1;
-      const backoffMs = Math.min(5 * 60_000, 5_000 * (2 ** Math.min(job.attempts, 6)));
-      job.runAt = Date.now() + backoffMs;
-      console.error(`Jobs: ${job.type} ${job.id} failed; retrying in ${backoffMs}ms:`, err.message);
+      const decision = jobRetryDecision(job, retryPolicyFor(job));
+      if (decision.retry) {
+        job.runAt = Date.now() + decision.delayMs;
+        console.warn(
+          `Jobs: ${job.type} ${job.id} attempt ${job.attempts} failed; ` +
+          `retrying in ${decision.delayMs}ms: ${err.message}`
+        );
+      } else {
+        jobs.delete(job.id);
+        console.error(
+          `Jobs: ${job.type} ${job.id} stopped after ${job.attempts} attempts: ${err.message}`
+        );
+        if (job.type === 'webhook') {
+          try {
+            await recordWebhookAsMissed(job.payload, 'processing_failed', err.message);
+          } catch (recordError) {
+            console.error(`Jobs: could not record failed webhook ${job.id}:`, recordError.message);
+          }
+        }
+      }
     }
     saveJobs();
   }
@@ -291,7 +339,13 @@ async function getSessionAccessToken(sessionId, companyCode) {
   const session = await database.getSessionById(sessionId);
   if (!session) throw new Error('Associate session is no longer active; please sign in again');
   if (session.accessToken && session.accessExpiresAt > new Date()) return session.accessToken;
+  return refreshSessionAccessToken(sessionId, companyCode, session);
+}
+
+async function refreshSessionAccessToken(sessionId, companyCode, knownSession = null) {
   if (sessionTokenPromises.has(sessionId)) return sessionTokenPromises.get(sessionId);
+  const session = knownSession || await database.getSessionById(sessionId);
+  if (!session) throw new Error('Associate session is no longer active; please sign in again');
   const pending = refreshSession(session, companyCode);
   sessionTokenPromises.set(sessionId, pending);
   try {
@@ -304,14 +358,17 @@ async function getSessionAccessToken(sessionId, companyCode) {
   }
 }
 
-async function getStoreAccessToken(companyCode, storeCode, preferredSessionId = null) {
-  const candidates = await database.getStoreSessions(companyCode, storeCode);
+async function getStoreAccessToken(companyCode, storeCode, preferredSessionId = null,
+  unavailableSessionIds = new Set()) {
+  const storeSessions = await database.getStoreSessions(companyCode, storeCode);
+  const candidates = storeSessions.filter(session => !unavailableSessionIds.has(session.id));
   if (preferredSessionId) {
     candidates.sort((a, b) => (a.id === preferredSessionId ? -1 : b.id === preferredSessionId ? 1 : 0));
   }
-  if (candidates.length === 0) {
+  if (storeSessions.length === 0) {
     throw new Error(`No signed-in associate is registered for ${companyCode}/${storeCode}`);
   }
+  if (candidates.length === 0) throw new Error('No usable associate session is available');
   let lastError;
   for (const session of candidates) {
     try {
@@ -395,9 +452,7 @@ async function fetchArticle(companyCode, storeCode, articleId, mapping) {
   const pageSize = 200;
   const maxPages = 25;   // hard cap: 5,000 articles per store
 
-  try {
-    const { token } = await getStoreAccessToken(companyCode, storeCode);
-
+  async function fetchPages(token) {
     for (let page = 0; page < maxPages; page++) {
       if (Date.now() >= deadline) {
         throw new Error(`Article lookup exceeded ${ARTICLE_LOOKUP_TIMEOUT_MS}ms`);
@@ -415,6 +470,13 @@ async function fetchArticle(companyCode, storeCode, articleId, mapping) {
         method: 'GET',
         headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
       });
+
+      if (resp.status === 401 || resp.status === 403) {
+        const error = new Error(`AIMS rejected the associate session with HTTP ${resp.status}`);
+        error.authRejected = true;
+        throw error;
+      }
+      if (!resp.ok) throw new Error(`AIMS article lookup returned HTTP ${resp.status}`);
 
       const json = await resp.json();
       const list = json.articleList || [];
@@ -436,6 +498,43 @@ async function fetchArticle(companyCode, storeCode, articleId, mapping) {
 
     console.warn(`Article ${articleId} not found in ${companyCode}/${storeCode}`);
     return null;
+  }
+
+  const rejectedSessionIds = new Set();
+  let lastAuthError;
+  try {
+    while (true) {
+      let selected;
+      try {
+        selected = await getStoreAccessToken(companyCode, storeCode, null, rejectedSessionIds);
+      } catch (selectionError) {
+        throw lastAuthError || selectionError;
+      }
+      try {
+        return await fetchPages(selected.token);
+      } catch (error) {
+        if (!error.authRejected) throw error;
+        lastAuthError = error;
+        if (error.message.includes('HTTP 401')) {
+          try {
+            const refreshedToken = await refreshSessionAccessToken(selected.sessionId, companyCode);
+            return await fetchPages(refreshedToken);
+          } catch (refreshError) {
+            if (!refreshError.authRejected && !/refresh|token|unauthorized|401/i.test(refreshError.message)) {
+              throw refreshError;
+            }
+            lastAuthError = refreshError;
+            if (!refreshError.authRejected || refreshError.message.includes('HTTP 401')) {
+              await database.clearSessionTokens(selected.sessionId);
+            }
+          }
+        }
+        rejectedSessionIds.add(selected.sessionId);
+        console.warn(
+          `ESL Auth: AIMS rejected a session for ${companyCode}/${storeCode}; trying another associate`
+        );
+      }
+    }
   } catch (err) {
     console.error(`Article fetch failed for ${articleId}:`, err.message);
     throw err;
@@ -586,12 +685,130 @@ app.post('/devices/unregister', requireSession, asyncRoute(async (req, res) => {
   res.json({ status: 'ok' });
 }));
 
+// Store-wide terminal call history. The scope comes from the authenticated
+// associate session, so an app cannot request another store's records.
+app.get('/calls/history', requireSession, asyncRoute(async (req, res) => {
+  const session = req.associateSession;
+  if (!session.companyCode || !session.storeCode) {
+    return res.status(409).json({ error: 'Choose a store before viewing call history' });
+  }
+  const requestedCompany = (req.query.company ?? session.companyCode).toString().trim();
+  const requestedStore = (req.query.store ?? session.storeCode).toString().trim();
+  if (requestedCompany !== session.companyCode || requestedStore !== session.storeCode) {
+    return res.status(403).json({ error: 'Call history is available only for your selected store' });
+  }
+  const limit = envIntValue(req.query.limit, 100, 1, 200);
+  const calls = await database.getStoreCallHistory(session.companyCode, session.storeCode, limit);
+  res.json({
+    calls: calls.map(call => ({
+      id: call.id,
+      message: call.message,
+      companyCode: call.company_code,
+      storeCode: call.store_code,
+      labelCode: call.label_code,
+      timestamp: new Date(call.created_at).getTime(),
+      status: call.status === 'missed'
+        ? 'MISSED'
+        : call.claimed_by_username === session.username
+          ? 'ACKNOWLEDGED'
+          : 'HANDLED_BY_OTHER',
+      handledBy: call.claimed_by_username || null,
+      missedReason: call.resolution_reason || null,
+    })),
+  });
+}));
+
 // ===========================================================================
 // Webhook Routes
 // ===========================================================================
 
-async function sendStoreMessage(companyCode, storeCode, message) {
-  const tokens = await database.getStoreDeviceTokens(companyCode, storeCode);
+function webhookCallDetails(body = {}) {
+  const eventInfo = Array.isArray(body.eventInfo) ? body.eventInfo[0] || {} : {};
+  const articleIds = Array.isArray(eventInfo.articleIds) ? eventInfo.articleIds : [];
+  return {
+    companyCode: body.customerCode || '',
+    storeCode: body.storeCode || '',
+    labelCode: eventInfo.labelCode || '',
+    articleId: articleIds[0] || '',
+  };
+}
+
+function appendCreatedCall(call) {
+  appendCallEvent({
+    type: 'created',
+    ts: Date.now(),
+    callId: call.id,
+    company: call.company_code,
+    store: call.store_code,
+    labelCode: call.label_code,
+    articleId: call.article_id,
+    articleName: call.article_name,
+    aisle: call.aisle || null,
+  });
+}
+
+function missedReasonText(reason) {
+  return ({
+    no_associates_signed_in: 'no associates were signed in',
+    no_registered_devices: 'no registered devices were available',
+    notification_delivery_failed: 'the notification could not be delivered',
+    processing_failed: 'the call could not be prepared in time',
+    no_response: 'no associate responded within the call window',
+  })[reason] || 'the call was not attended';
+}
+
+async function finalizeMissedCall(call, reason, extraDetails = {}) {
+  const missed = await database.markCallMissed({
+    callId: call.callId || call.id || null,
+    companyCode: call.companyCode || call.company_code || '',
+    storeCode: call.storeCode || call.store_code || '',
+    labelCode: call.labelCode || call.label_code || '',
+    reason,
+    details: extraDetails,
+  });
+  if (!missed) return false;
+  appendCallEvent({
+    type: 'missed',
+    ts: Date.now(),
+    callId: missed.id,
+    company: missed.company_code,
+    store: missed.store_code,
+    labelCode: missed.label_code,
+    reason,
+  });
+  console.warn(
+    `Call missed for ${missed.company_code}/${missed.store_code}: ${missedReasonText(reason)}`
+  );
+  return true;
+}
+
+async function recordWebhookAsMissed(body, reason, errorMessage = '') {
+  const details = webhookCallDetails(body);
+  if (!details.companyCode || !details.storeCode || !details.labelCode) return false;
+  const created = await database.createCall({
+    ...details,
+    articleName: details.articleId || null,
+    aisle: null,
+    message: details.articleId
+      ? `Help requested for item ${details.articleId}`
+      : 'Customer help requested',
+    payload: body,
+  });
+  if (created.created) {
+    await database.addCallEvent({
+      callId: created.call.id,
+      eventType: 'created',
+      details: { companyCode: details.companyCode, storeCode: details.storeCode },
+    });
+    appendCreatedCall(created.call);
+  }
+  if (created.call.status !== 'open') return false;
+  return finalizeMissedCall(created.call, reason,
+    errorMessage ? { error: errorMessage.slice(0, 500) } : {});
+}
+
+async function sendStoreMessage(companyCode, storeCode, message, registeredTokens = null) {
+  const tokens = registeredTokens || await database.getStoreDeviceTokens(companyCode, storeCode);
   if (tokens.length === 0) {
     console.warn(`FCM: no registered devices for ${companyCode}/${storeCode}`);
     return { successCount: 0, failureCount: 0, deviceCount: 0 };
@@ -653,6 +870,14 @@ async function processWebhookBody(rawBody) {
       return;
     }
 
+    const registeredTokens = await database.getStoreDeviceTokens(companyCode, storeCode);
+    if (registeredTokens.length === 0) {
+      const activeSessions = await database.countActiveStoreSessions(companyCode, storeCode);
+      await recordWebhookAsMissed(body,
+        activeSessions > 0 ? 'no_registered_devices' : 'no_associates_signed_in');
+      return;
+    }
+
     const mapping = getFieldMapping(companyCode, storeCode);
     const article = await fetchArticle(companyCode, storeCode, articleId, mapping);
 
@@ -708,41 +933,57 @@ async function processWebhookBody(rawBody) {
       payload: body,
     });
     if (!created.created) {
-      console.log(`Webhook: duplicate open call ignored for ${companyCode}/${storeCode}/${labelCode}`);
+      console.log(`Webhook: duplicate recent call ignored for ${companyCode}/${storeCode}/${labelCode}`);
       return;
     }
 
     const callId = created.call.id;
-    const fcmResult = await sendStoreMessage(companyCode, storeCode, {
-      data: {
-        title:       'Employee Call',
-        message:     alertMessage,
-        callId,
-        companyCode,
-        storeCode,
-        labelCode,
-        payload:     JSON.stringify(body),
-      },
-      android: { priority: 'high', ttl: 60000 },
+    await database.addCallEvent({
+      callId,
+      eventType: 'created',
+      details: { companyCode, storeCode },
     });
+    appendCreatedCall(created.call);
+    enqueueJob('expire-call', {
+      callId,
+      companyCode,
+      storeCode,
+      labelCode,
+    }, Date.now() + CALL_RESPONSE_TIMEOUT_MS);
+
+    let fcmResult;
+    try {
+      fcmResult = await sendStoreMessage(companyCode, storeCode, {
+        data: {
+          title:       'Employee Call',
+          message:     alertMessage,
+          callId,
+          companyCode,
+          storeCode,
+          labelCode,
+          payload:     JSON.stringify(body),
+        },
+        android: { priority: 'high', ttl: CALL_RESPONSE_TIMEOUT_MS },
+      }, registeredTokens);
+    } catch (deliveryError) {
+      await finalizeMissedCall(created.call, 'notification_delivery_failed', {
+        error: deliveryError.message.slice(0, 500),
+      });
+      return;
+    }
     console.log(`FCM call ${callId}:`, fcmResult);
 
     await database.addCallEvent({
       callId,
-      eventType: 'delivered',
+      eventType: 'delivery',
       details: fcmResult,
     });
-
-    appendCallEvent({
-      type:         'delivered',
-      ts:           Date.now(),
-      company:      companyCode,
-      store:        storeCode,
-      labelCode,
-      articleId,
-      articleName:  name,
-      aisle:        aisle || null,
-    });
+    if (fcmResult.successCount === 0) {
+      const reason = fcmResult.deviceCount === 0
+        ? 'no_registered_devices'
+        : 'notification_delivery_failed';
+      await finalizeMissedCall(created.call, reason, fcmResult);
+    }
   } catch (err) {
     console.error('Webhook processing failed:', err.message);
     throw err;
@@ -835,19 +1076,28 @@ app.post('/esl/status', requireSession, asyncRoute(async (req, res) => {
   if (req.associateSession.companyCode !== companyCode || req.associateSession.storeCode !== storeCode) {
     return res.status(403).json({ error: 'This associate is not registered to that store' });
   }
-  appendCallEvent({
-    type:      status,           // 'missed' or 'dismissed'
-    ts:        Date.now(),
-    company:   companyCode,
-    store:     storeCode,
-    labelCode,
-  });
-  await database.addCallEvent({
-    callId: callId || null,
-    eventType: status,
-    session: req.associateSession,
-    details: { companyCode, storeCode, labelCode },
-  });
+  if (callId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(callId)) {
+    return res.status(400).json({ error: 'callId is invalid' });
+  }
+  if (status === 'missed') {
+    await finalizeMissedCall({ callId, companyCode, storeCode, labelCode }, 'no_response', {
+      reportedBy: req.associateSession.username,
+    });
+  } else {
+    appendCallEvent({
+      type: status,
+      ts: Date.now(),
+      company: companyCode,
+      store: storeCode,
+      labelCode,
+    });
+    await database.addCallEvent({
+      callId: callId || null,
+      eventType: status,
+      session: req.associateSession,
+      details: { companyCode, storeCode, labelCode },
+    });
+  }
   res.json({ status: 'ok' });
 }));
 
@@ -954,13 +1204,13 @@ app.get('/admin/analytics', requireSession, (req, res) => {
     e => e.company === company && e.store === store
   );
 
-  // Walk events in order to stitch status updates back onto their delivered call.
+  // Walk events in order to stitch status updates back onto their call.
   events.sort((a, b) => a.ts - b.ts);
   const calls = [];                          // each: {deliveredAt, articleName, aisle, status, ackedAt}
   const open  = new Map();                   // labelCode -> index in calls (latest open call)
 
   for (const e of events) {
-    if (e.type === 'delivered') {
+    if (e.type === 'delivered' || e.type === 'created') {
       const call = {
         deliveredAt: e.ts,
         labelCode:   e.labelCode,
@@ -972,7 +1222,7 @@ app.get('/admin/analytics', requireSession, (req, res) => {
       };
       calls.push(call);
       open.set(e.labelCode, calls.length - 1);
-    } else {
+    } else if (['acknowledged', 'missed', 'dismissed'].includes(e.type)) {
       const idx = open.get(e.labelCode);
       if (idx === undefined) continue;  // status update with no prior delivered — ignore
       const call = calls[idx];

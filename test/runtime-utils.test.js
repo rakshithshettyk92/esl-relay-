@@ -9,6 +9,7 @@ const {
   articleCacheKey,
   validTimeZone,
   perHour,
+  jobRetryDecision,
 } = require('../src/runtime-utils');
 
 test('boundedInt applies defaults and clamps unsafe values', () => {
@@ -57,4 +58,19 @@ test('hour buckets use the requesting device timezone', () => {
   const calls = [{ deliveredAt: Date.parse('2026-09-01T01:30:00Z') }];
   assert.equal(perHour(calls, 'America/New_York')[21], 1);
   assert.equal(perHour(calls, 'Asia/Kolkata')[7], 1);
+});
+
+test('webhook retries stop at the attempt limit', () => {
+  const policy = { maxAttempts: 3, maxAgeMs: 60_000, baseDelayMs: 5_000, maxDelayMs: 30_000 };
+  assert.deepEqual(jobRetryDecision({ attempts: 1, createdAt: 1_000 }, policy, 2_000), {
+    retry: true, attempts: 1, ageMs: 1_000, delayMs: 10_000,
+  });
+  assert.equal(jobRetryDecision({ attempts: 3, createdAt: 1_000 }, policy, 2_000).retry, false);
+});
+
+test('webhook retries stop when the call window has ended', () => {
+  const policy = { maxAttempts: 5, maxAgeMs: 60_000, baseDelayMs: 5_000, maxDelayMs: 30_000 };
+  const decision = jobRetryDecision({ attempts: 1, createdAt: 1_000 }, policy, 61_000);
+  assert.equal(decision.retry, false);
+  assert.equal(decision.ageMs, 60_000);
 });

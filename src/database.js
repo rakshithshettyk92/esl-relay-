@@ -107,7 +107,8 @@ async function initDatabase() {
       claimed_by_username TEXT,
       claimed_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      closed_at TIMESTAMPTZ
+      closed_at TIMESTAMPTZ,
+      resolution_reason TEXT
     );
     CREATE INDEX IF NOT EXISTS calls_store_status_idx
       ON calls (company_code, store_code, status, created_at DESC);
@@ -148,6 +149,8 @@ async function initDatabase() {
       message TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS system_logs_logged_idx ON system_logs (logged_at DESC);
+
+    ALTER TABLE calls ADD COLUMN IF NOT EXISTS resolution_reason TEXT;
   `);
   await pool.query('SELECT 1');
 }
@@ -263,15 +266,25 @@ async function getStoreSessions(companyCode, storeCode) {
   return result.rows.map(hydrateSession);
 }
 
+async function countActiveStoreSessions(companyCode, storeCode) {
+  const result = await pool.query(`
+    SELECT COUNT(*)::int AS count
+    FROM associate_sessions
+    WHERE company_code=$1 AND store_code=$2 AND revoked_at IS NULL
+  `, [companyCode, storeCode]);
+  return result.rows[0]?.count || 0;
+}
+
 async function createCall(call) {
   await pool.query(`
-    UPDATE calls SET status='missed', closed_at=NOW()
+    UPDATE calls SET status='missed', closed_at=NOW(),
+      resolution_reason=COALESCE(resolution_reason, 'no_response')
     WHERE status='open' AND created_at < NOW() - INTERVAL '2 minutes'
   `);
   const recent = await pool.query(`
     SELECT * FROM calls
     WHERE company_code=$1 AND store_code=$2 AND label_code=$3
-      AND status='open' AND created_at > NOW() - INTERVAL '30 seconds'
+      AND created_at > NOW() - INTERVAL '30 seconds'
     ORDER BY created_at DESC LIMIT 1
   `, [call.companyCode, call.storeCode, call.labelCode]);
   if (recent.rows[0]) return { call: recent.rows[0], created: false };
@@ -285,6 +298,35 @@ async function createCall(call) {
   `, [id, call.companyCode, call.storeCode, call.labelCode, call.articleId || null,
     call.articleName || null, call.aisle || null, call.message, call.payload || null]);
   return { call: result.rows[0], created: true };
+}
+
+async function markCallMissed({ callId, companyCode, storeCode, labelCode, reason, details }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(`
+      UPDATE calls SET status='missed', closed_at=NOW(), resolution_reason=$5
+      WHERE status='open' AND (
+        ($1::uuid IS NOT NULL AND id=$1)
+        OR ($1::uuid IS NULL AND company_code=$2 AND store_code=$3 AND label_code=$4)
+      )
+      RETURNING *
+    `, [callId || null, companyCode, storeCode, labelCode, reason]);
+    const call = result.rows[0];
+    if (call) {
+      await client.query(`
+        INSERT INTO call_events (call_id, event_type, details)
+        VALUES ($1, 'missed', $2)
+      `, [call.id, { ...(details || {}), reason }]);
+    }
+    await client.query('COMMIT');
+    return call || null;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function claimCall({ callId, companyCode, storeCode, labelCode, session }) {
@@ -348,11 +390,24 @@ async function getOpsSummary() {
 async function getRecentCalls(limit = 50) {
   const result = await pool.query(`
     SELECT id, company_code, store_code, label_code, article_name, aisle, message,
-           status, claimed_by_username, created_at, claimed_at
+           status, claimed_by_username, created_at, claimed_at, closed_at, resolution_reason
     FROM calls
     WHERE created_at >= NOW() - INTERVAL '7 days'
     ORDER BY created_at DESC LIMIT $1
   `, [Math.max(1, Math.min(200, limit))]);
+  return result.rows;
+}
+
+async function getStoreCallHistory(companyCode, storeCode, limit = 100) {
+  const result = await pool.query(`
+    SELECT id, company_code, store_code, label_code, article_name, aisle, message,
+           status, claimed_by_username, created_at, claimed_at, closed_at, resolution_reason
+    FROM calls
+    WHERE company_code=$1 AND store_code=$2
+      AND status IN ('claimed', 'closed', 'missed')
+      AND created_at >= NOW() - INTERVAL '7 days'
+    ORDER BY created_at DESC LIMIT $3
+  `, [companyCode, storeCode, Math.max(1, Math.min(200, limit))]);
   return result.rows;
 }
 
@@ -448,11 +503,14 @@ module.exports = {
   removeSessionDevice,
   getStoreDeviceTokens,
   getStoreSessions,
+  countActiveStoreSessions,
   createCall,
   claimCall,
+  markCallMissed,
   addCallEvent,
   getOpsSummary,
   getRecentCalls,
+  getStoreCallHistory,
   ensureOpsAdmin,
   authenticateOpsAdmin,
   createOpsSession,
